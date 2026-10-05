@@ -3,46 +3,24 @@ const path = require('path');
 
 const baseManifest = require('./manifest.base.json');
 
-// Chrome-specific configuration
-const chromeManifest = {
+// Chromium 内核浏览器（Edge / Chrome）：后台用 service worker。
+const manifest = {
   ...baseManifest,
   background: {
     service_worker: "background.js"
   }
 };
 
-// Firefox-specific configuration
-const firefoxManifest = {
-  ...baseManifest,
-  background: {
-    scripts: ["background.js"]
-  },
-  browser_specific_settings: {
-    gecko: {
-      id: "mengxibitan.yu@gmail.com",
-      strict_min_version: "109.0",
-      data_collection_permissions: {
-        required: ["none"]
-      }
-    }
-  }
-};
-
-// Define paths
-const DIST_DIR = path.join(__dirname, 'dist');
-const CHROME_DIR = path.join(DIST_DIR, 'chrome');
-const FIREFOX_DIR = path.join(DIST_DIR, 'firefox');
+const CHROME_DIR = path.join(__dirname, 'dist', 'chrome');
 
 // Define assets to copy (add any other files/folders your extension needs)
-const ASSETS_TO_COPY = ['background.js', 'images'];
+const ASSETS_TO_COPY = ['background.js', 'weapi.js', 'images'];
 
-function buildExtension(browser, manifest, outputDir) {
-  console.log(`Building for ${browser}...`);
+function build(outputDir) {
+  console.log(`Building for Chromium...`);
 
   // 1. Create the output directory
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-  }
+  fs.mkdirSync(outputDir, { recursive: true });
 
   // 2. Write the tailored manifest.json
   fs.writeFileSync(
@@ -66,11 +44,6 @@ function buildExtension(browser, manifest, outputDir) {
   console.log(`Build complete! Output: ${outputDir}\n`);
 }
 
-// Clean previous build
-if (fs.existsSync(DIST_DIR)) {
-  fs.rmSync(DIST_DIR, { recursive: true, force: true });
-}
+fs.rmSync(path.join(__dirname, 'dist'), { recursive: true, force: true });
 
-// Execute builds
-buildExtension('Chrome', chromeManifest, CHROME_DIR);
-buildExtension('Firefox', firefoxManifest, FIREFOX_DIR);
+build(CHROME_DIR);
