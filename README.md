@@ -42,9 +42,9 @@ Chromium内核浏览器用户请点击下方链接跳转至Chrome Web Store, 点
 
 [Chrome应用商店](https://chromewebstore.google.com/detail/neteasemusicactivator/blmpkmpldchiiecilhgpahegoibafgci)
 
-> 商店里的是上游版本，只有每日签到。本 fork 新增的乐签 / 云贝 / 成长值需要自行 `node build.js` 后以「加载解压缩的扩展」方式安装。
+> 商店里的是上游版本，只有每日签到。本 fork 新增的乐签 / 云贝 / 成长值需要自行 `node build.js` 后以「开启开发者模式 - 加载解压缩的扩展」方式安装。
 
-Firefox用户请点击下方链接跳转至Firefox Add-ons Store, 点击右侧蓝色按钮「Add to Firefox」即可。
+Firefox用户请点击下方链接跳转至Firefox Add-ons Store, 点击右侧蓝色按钮「Add to Firefox」即可，此为旧版，有需要也可以提交issue交由我开发。
 
 [Firefox Add-ons Store](https://addons.mozilla.org/zh-CN/firefox/addon/neteasemusicactivator/)
 
@@ -74,7 +74,7 @@ node build.js        # 生成 dist/chrome；在 edge://extensions 打开开发�
 node --test          # 离线测试：weapi 加密层等价比对 + 调度门控行为，不联网
 ```
 
-新增接口需要 weapi 加密时，统一走 `weapi.js` 的 `weapiRequest(host, path, data, csrfToken, query)`；已实现的端点与触发时机见 `background.js` 的 `TASKS` 表。
+新增接口需要 weapi 加密时，统一走 `weapi.js` 的 `weapiRequest(host, path, data, csrfToken, query)`；已实现的端点与触发时机见 `background.js` 的 `TASKS` 表。二改的协议调研、接口清单与设计取舍记录在 `PLAN-signin-vip.md`。
 
 ---
 
