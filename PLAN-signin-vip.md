@@ -383,7 +383,7 @@ node --test          # 18 项，全程不联网、不碰 chrome.*
 |---|---|---|---|
 | 1 | 扩展 service worker 发出的 weapi 请求（无 `Referer`、`Origin: chrome-extension://…`、`Sec-Fetch-Site: none`）是否被网易风控拦截 | 曾是 P0/P1 阻塞性风险 | ✅ **已验，2026-10-05 13:50 真机运行**：`pointmall/user/sign`、`sign/config`、`interface3.../vip-center-bff/task/sign` 三个 weapi 端点全部返回 `code:200` 并被正确解出，`Referer`/`UA` 不需要伪造，`declarativeNetRequest` / `scripting` 退路均不必启用。 |
 | 2 | `pointmall/user/sign` 等接口是否也接受现有那种明文 `/api/` POST | 若接受，P1 可以完全不写加密 | 未探（按 weapi 实现已完成，无必要） |
-| 3 | 乐签对非黑胶 VIP 账号返回什么 | 影响日志文案 | ⏳ **未验**：当时用的账号本身就是 SVIP（`growhpoint/basic` 返回 `vipType:300`、`levelName:"SVIP黑胶·柒"`），所谓"已验"只是 `code:200 + data:true` 的回执，而该回执并不等价于落签（见 #7）。Go 侧「Music Sign 不要求 VIP 权益」的注释仍按未证事实对待 |
+| 3 | 乐签对非黑胶 VIP 账号返回什么 | 影响日志文案 | ⏳ **未验**：验证所用账号本身就带 VIP 权益（`growhpoint/basic` 的 `vipType`/`latestVipStatus` 可见），所谓"已验"只是 `code:200 + data:true` 的回执，而该回执并不等价于落签（见 #7）。Go 侧「Music Sign 不要求 VIP 权益」的注释仍按未证事实对待 |
 | 4 | `reward/getall` 的返回形态 | P2 判定依据 | ✅ **成功路径已验**（2026-10-05 22:56 真机）：返回 `code:200 + data.result === true`，日志「VIP 成长值：领取成功」，与 Go 结构体一致。⏳ 非会员 / 已满级 / 达本月 300·400 上限三种分支仍未验（验证时所用账号是有权益且未满级），但这三条只影响日志文案，不影响正确性 —— 未知 `code` 一律归到"记日志、不重试" |
 | 5 | 满勤签到抽奖 `extraLotteryId` 的领取语义 | 少一个可选奖励 | 本期不做（Go 项目自己也是 Pending，`sign.go:146`） |
 | 6 | 连签阶段奖励是否存在"必须手动点领奖"的时间窗 | 可能漏领 | ✅ 部分已验：本机 `sign/config` 返回 200 且无待领项，日志「云贝连签奖励：无待领」（10-07 00:01 首次真领到：`已领取 1/1`） |
