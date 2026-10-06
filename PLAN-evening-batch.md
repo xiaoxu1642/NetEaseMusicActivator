@@ -216,3 +216,22 @@ function shouldRunNight(now, doneOn) {
 - 2026-10-06 00:08 晨批：`每日签到成功 {point:2}` / `云贝签到成功` / `云贝连签奖励：无待领` / `乐签成功`；`taskDoneOn` 四个晨批键全部推进到 10-06。
 - 同日 17:26 客户端：乐签日历 10-05 已签、10-06 未签、打卡按钮可点 —— 与晨批"乐签成功"矛盾，判定为"凌晨打卡未落到当天"。
 - 10-05 22:56：`VIP 成长值：领取成功`（时间窗功能真机验证）。
+
+---
+
+## 补充：v1.2.1（2026-10-06 晚）打卡"假成功"发现与改道
+
+v1.2.0 发布当晚的真机验证推翻了两处判断，均已修复并发布 v1.2.1：
+
+1. **打卡端点是"假成功"**。`/weapi/vip-center-bff/task/sign`（interface3）会返回 `{code:200,data:true}`，
+   但服务端不产生签到记录：同日 `sign/info` 的 `recordId=0`、minidesk 卡片 `sign:false`、客户端日历空格，
+   三处视图一致。逐项排除后确认，只有**客户端同款形态**才会真正落签：
+   eapi（`interface.music.163.com/eapi/vip-center-bff/task/sign`）+ 设备身份 cookie + `e_r:true` + `x-aeapi:true`（加密响应）。
+   改造后实测打卡成功：`sign/info.recordId`、卡片 `signTime`、客户端日历三处同步出现当日记录。
+2. **`sign/info` 的 `today` 字段被误读**。它只标记"今天的格子"，不是"已签"；
+   已签判定改为 minidesk 卡片：`signInfoList[]` 中 `today===true` 的条目 `sign===true`。
+   v1.2.0 晚间复核据此误报"今日已签"、未触发补打 —— 反过来说明复核机制本身工作正常，只是判据错了。
+
+实现落点：新增 `eapi.js`（纯 JS MD5 + AES-128-ECB + eapi 装配/响应解密，离线测试与 Node 内置实现逐字节比对）；
+`background.js` 打卡前经 `chrome.cookies.set` 写入设备身份 cookie，打卡走 `eapiRequest`；复核改用卡片判定，补打后回读确认。
+"凌晨打卡可能落到前一天"的旧解释作废（§1 与 §4 的相应动机描述以本节为准）。

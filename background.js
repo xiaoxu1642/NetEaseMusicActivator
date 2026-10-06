@@ -1,4 +1,4 @@
-importScripts("weapi.js");
+importScripts("weapi.js", "eapi.js");
 
 const TARGET_URL = "https://music.163.com/";
 const BUFFER_TIME_MS = 2000;
@@ -14,7 +14,7 @@ const MUSIC_HOST = "music.163.com";
 const INTERFACE_HOST = "interface.music.163.com";
 const VIP_CENTER_HOST = "interface3.music.163.com";
 
-// 乐签的签到日边界晚于凌晨；云贝任务奖励与成长值都要等白天攒进度，所以这些动作固定在本地时间 21:00 之后。
+// 乐签打卡可能被服务端静默丢弃（曾出现接口成功但未落签）；云贝任务奖励与成长值要等白天攒进度，所以这些动作固定在本地时间 21:00 之后。
 const VIP_CLAIM_HOUR = 21;
 const TASK_STATE_KEY = "taskDoneOn";
 const VIP_GROWTH_LOG_KEY = "vipGrowthLog";
@@ -281,31 +281,67 @@ async function claimYunbeiTasks() {
     };
 }
 
-async function signVipMusic() {
-    const data = await weapiRequest(VIP_CENTER_HOST, "/weapi/vip-center-bff/task/sign", {}, await getCookie("__csrf"));
-    if (data.code !== 200) return notLoggedIn(data.code, "乐签") || rejected(data.code, "乐签");
-    // 凌晨打卡可能落到前一天（乐签签到日边界晚于 00:00），这里只表示请求被受理，终态看晚间复核。
-    if (data.data === true) return { done: true, message: "乐签：打卡请求成功" };
+// 乐签打卡只认"客户端形态"的 eapi 请求：设备身份 cookie + e_r:true + x-aeapi（2026-10-06 实测；
+// 走 weapi 的同名路径会返回成功但不落签）。身份值对齐参考实现桌面工具的 EAPI 档默认配置。
+const VIP_SIGN_IDENTITY = {
+    channel: "netease",
+    ntes_kaola_ad: "1",
+    WEVNSM: "1.0",
+    appver: "9.2.85",
+    os: "android",
+    osver: "9",
+    buildver: "250418145357",
+    resolution: "1600x900",
+    mobilename: "SM-S9180",
+    brand: "samsung",
+    versioncode: "9002085",
+    packageType: "release"
+};
 
-    return { done: true, message: "乐签：本次未完成", details: { reason: data.message || data.msg || "" } };
+async function ensureVipSignIdentityCookies() {
+    const hexChars = "0123456789ABCDEF";
+    let deviceId = "";
+    for (let i = 0; i < 52; i++) deviceId += hexChars[Math.floor(Math.random() * 16)];
+
+    const cookies = { ...VIP_SIGN_IDENTITY, deviceId };
+    await Promise.all(Object.entries(cookies).map(([name, value]) => new Promise((resolve) => {
+        chrome.cookies.set({ url: "https://music.163.com/", domain: ".music.163.com", name, value, path: "/" }, () => resolve());
+    })));
+}
+
+async function requestVipSignPunch() {
+    await ensureVipSignIdentityCookies();
+    return eapiRequest(INTERFACE_HOST, "/api/vip-center-bff/task/sign", { e_r: true, header: "{}" });
+}
+
+async function fetchVipSignCard() {
+    const card = await weapiRequest(VIP_CENTER_HOST, "/weapi/vipnewcenter/app/minidesk/music/sign/pc", { type: "0" }, await getCookie("__csrf"));
+    if (card.code !== 200) return { code: card.code };
+    // 已签判定看卡片条目的 sign；today 只是"今天的格子"标记，曾据此误报已签（2026-10-06）。
+    const list = card.data && Array.isArray(card.data.signInfoList) ? card.data.signInfoList : [];
+    const todayRow = list.find((row) => row && row.today === true);
+    return { signed: !!(todayRow && todayRow.sign === true) };
+}
+
+async function signVipMusic() {
+    const reply = await requestVipSignPunch();
+    if (reply.code !== 200) return notLoggedIn(reply.code, "乐签") || rejected(reply.code, "乐签");
+    if (reply.data === true) return { done: true, message: "乐签：打卡请求成功" };
+
+    return { done: true, message: "乐签：本次未完成", details: { reason: reply.message || "" } };
 }
 
 async function verifyVipSign() {
-    const csrfToken = await getCookie("__csrf");
-    const info = await weapiRequest(VIP_CENTER_HOST, "/weapi/vipnewcenter/app/user/sign/info", {}, csrfToken);
-    if (info.code !== 200) return notLoggedIn(info.code, "乐签复核") || rejected(info.code, "乐签复核");
+    const before = await fetchVipSignCard();
+    if (before.code !== undefined) return notLoggedIn(before.code, "乐签复核") || rejected(before.code, "乐签复核");
+    if (before.signed) return { done: true, message: "乐签复核：今日已签" };
 
-    const rows = Array.isArray(info.data) ? info.data : [];
-    if (rows.some((row) => row && row.today === true)) {
-        return { done: true, message: "乐签复核：今日已签" };
-    }
-
-    const punch = await weapiRequest(VIP_CENTER_HOST, "/weapi/vip-center-bff/task/sign", {}, csrfToken);
+    const punch = await requestVipSignPunch();
     if (punch.code !== 200) return notLoggedIn(punch.code, "乐签补打") || rejected(punch.code, "乐签补打");
 
-    return punch.data === true
-        ? { done: true, message: "乐签复核：凌晨打卡未生效，已补打成功" }
-        : { done: true, message: "乐签复核：补打未完成", details: { reason: punch.message || punch.msg || "" } };
+    const after = await fetchVipSignCard();
+    if (after.signed) return { done: true, message: "乐签复核：凌晨打卡未生效，已补打成功" };
+    return { done: true, message: "乐签复核：补打后仍未生效", details: { punchAck: punch.data === true } };
 }
 
 async function claimVipGrowth() {

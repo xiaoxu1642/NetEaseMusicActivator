@@ -14,7 +14,7 @@ const manifest = {
 const CHROME_DIR = path.join(__dirname, 'dist', 'chrome');
 
 // Define assets to copy (add any other files/folders your extension needs)
-const ASSETS_TO_COPY = ['background.js', 'weapi.js', 'images'];
+const ASSETS_TO_COPY = ['background.js', 'weapi.js', 'eapi.js', 'images'];
 
 function build(outputDir) {
   console.log(`Building for Chromium...`);

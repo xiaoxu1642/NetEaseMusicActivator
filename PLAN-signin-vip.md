@@ -74,8 +74,8 @@
 
 | 步骤 | weapi 路径 | Host | 请求体 | 判定 | 协议来源 |
 |---|---|---|---|---|---|
-| ① 打卡 | `/weapi/vip-center-bff/task/sign` | `interface3.music.163.com` | `{}`（Go 侧 URL 尾部带空值 `?isNew=`） | `code===200 && data===true` 成功；`data===false` 时读 `message` 文案 | Go `api/weapi/vip.go:1311`；eapi 等价 `api/eapi/vip.go:68-97`；Node `module/vip_sign.js:4-11` |
-| ② 打卡信息 | `/weapi/vipnewcenter/app/user/sign/info` | `interface3.music.163.com` | `{}` | `data[].today===true` 表示今天已签，`score` 为成长值 | Go `vip.go:593`、`585`；Node `module/vip_sign_info.js:7` |
+| ① 打卡 | `/weapi/vip-center-bff/task/sign` | `interface3.music.163.com` | `{}`（Go 侧 URL 尾部带空值 `?isNew=`） | `code===200 && data===true` 成功；`data===false` 时读 `message` 文案。⚠️ **2026-10-06 实测更正：weapi 形态返回成功但服务端不落签（"假成功"），须用客户端同款 eapi 形态（设备身份 cookie + `e_r:true` + `x-aeapi`），详见 `PLAN-evening-batch.md` 补充节** | Go `api/weapi/vip.go:1311`；eapi 等价 `api/eapi/vip.go:68-97`；Node `module/vip_sign.js:4-11` |
+| ② 打卡信息 | `/weapi/vipnewcenter/app/user/sign/info` | `interface3.music.163.com` | `{}` | ~~`data[].today===true` 表示今天已签~~；`score` 为成长值。⚠️ **更正（2026-10-06）：`today` 只是"当日格子"标记，非已签判定；已签看 minidesk 卡片 `signInfoList[].sign`，详见 `PLAN-evening-batch.md` 补充节** | Go `vip.go:593`、`585`；Node `module/vip_sign_info.js:7` |
 | ③ 日历卡片（展示用） | `/weapi/vipnewcenter/app/minidesk/music/sign/pc` | `interface3.music.163.com` | `{"type":"0"}` 或 `{"type":"1"}` | `data.text/subText/btnText`、`data.signInfoList[]{dayText,sign,today,signTime,songCoverUrl}` | Go `vip.go:1503`；eapi 版 `api/eapi/vip.go:383-444` |
 | ④ 当月累计/节点奖 | `/weapi/vipnewcenter/app/level/user/checkin/history/detail` | `interface3.music.163.com` | `{"type":"1","signDayTime":"<Date.now()>"}` | `monthCheckInTotalDay`、`monthCheckInPrizList[].day`（7/14/28 节点）；**服务端字段拼写就是 `prizList`** | Go `vip.go:1434`；eapi 版 `api/eapi/vip.go:286-381` |
 

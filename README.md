@@ -15,23 +15,23 @@
 | 新增 | 说明 |
 |---|---|
 | 云贝中心签到 + 连续签到阶段奖励 | 除原有 `/api/point/dailyTask` 外，另走 `pointmall/user/sign` 完成云贝签到，并自动领取已达标（3 / 7 / 28 天）的阶段奖励 |
-| 黑胶乐签 | 走 `vip-center-bff/task/sign` 完成每日乐签打卡，无会员权益也可签到；21:00 后自动复核，凌晨打卡未生效时补打 |
+| 黑胶乐签 | 打卡走客户端同款 eapi 加密请求（`vip-center-bff/task/sign`），无会员权益也可签到；21:00 后自动复核，未签上时补打 |
 | 云贝任务奖励一键领取 | 走 `usertool/task/todo/query` + `usertool/task/point/receive`，在 21:00–23:59 与成长值同批领取已完成的任务奖励（如听漫游），只领已完成项、不代做任务 |
 | VIP 成长值一键领取 | 走 `vipnewcenter/app/level/task/reward/getall`，只在本地时间 21:00–23:59 触发、每天最多一次 |
-| weapi 加密层 | 上述接口只接受 weapi 密文。`weapi.js` 用 WebCrypto（AES-128-CBC）+ BigInt 裸 RSA 实现，**零第三方依赖**，不引入 crypto-js / node-forge |
+| weapi / eapi 加密层 | 上述接口只接受密文。`weapi.js` 用 WebCrypto（AES-128-CBC）+ BigInt 裸 RSA；`eapi.js` 自实现 MD5 + AES-128-ECB（WebCrypto 不支持 ECB）。**零第三方依赖**，不引入 crypto-js / node-forge |
 | 离线测试 | `node --test`：加密层与独立实现逐字节比对，调度门控用桩件验证 |
 
 两点取舍需要说明：
 
 - **只产出 Chromium / Edge 构建**。Firefox 的构建分支已移除，addons.mozilla.org 上仍是上游旧版，不含上述功能。
-- **为什么晚间批定在 21:00 之后**。云贝任务奖励与成长值都要等白天攒进度，白天去领往往无值可领；乐签的签到日切换又晚于凌晨，00:00 刚过就打卡会落到前一天。所以「乐签复核补打 + 云贝任务奖励领取 + 成长值领取」都只在 21:00–23:59 触发，每天各一次。错过当晚：成长值与云贝任务奖励会在下一个窗口一并领走；乐签属签到类，漏一晚即断签一天。
+- **为什么晚间批定在 21:00 之后**。云贝任务奖励与成长值都要等白天攒进度，白天去领往往无值可领；乐签打卡还存在服务端静默丢弃的情况（接口返回成功但未落签），隔天再复核一次才能兜住。所以「乐签复核补打 + 云贝任务奖励领取 + 成长值领取」都只在 21:00–23:59 触发，每天各一次。错过当晚：成长值与云贝任务奖励会在下一个窗口一并领走；乐签属签到类，漏一晚即断签一天。
 
 许可证沿用上游的 GPL-3.0，二改代码同样以 GPL-3.0 开源。
 
 ## 主要功能
 
 - **每日签到**：自动完成网页端签到与云贝中心签到，并领取已达标的连续签到奖励（3 天 / 7 天 / 28 天）。
-- **黑胶乐签**：自动完成「黑胶乐签」打卡，无会员权益也可签到；晚间自动复核，凌晨打卡未生效则补打。
+- **黑胶乐签**：自动完成「黑胶乐签」打卡（走客户端同款 eapi 加密请求），无会员权益也可签到；晚间 21:00 后自动复核，未签上则补打。
 - **云贝任务奖励一键领取**：每天 21:00–23:59 把已完成的云贝任务奖励（如听漫游）逐个领取，只领已完成项，不代做任务本身。
 - **VIP 成长值一键领取**：每天 21:00–23:59 之间领取已完成的成长任务奖励，每天只调用一次。成长值不过期，错过当晚会在下一个窗口一并领取。
 - **登录提醒**：如果用户尚未登录，将发送一条通知进行提醒，点击跳转至后台已打开的网页。
@@ -76,7 +76,7 @@ node build.js        # 生成 dist/chrome；在 edge://extensions 打开开发�
 node --test          # 离线测试：weapi 加密层等价比对 + 调度门控行为，不联网
 ```
 
-新增接口需要 weapi 加密时，统一走 `weapi.js` 的 `weapiRequest(host, path, data, csrfToken, query)`；已实现的端点与触发时机见 `background.js` 的 `TASKS` 表。二改的协议调研、接口清单与设计取舍记录在 `PLAN-signin-vip.md`。
+新增接口需要加密时：weapi 统一走 `weapi.js` 的 `weapiRequest(host, path, data, csrfToken, query)`；eapi 走 `eapi.js` 的 `eapiRequest(host, apiPath, payload)`（乐签打卡目前是唯一 eapi 用例）。已实现的端点与触发时机见 `background.js` 的 `TASKS` 表。二改的协议调研、接口清单与设计取舍记录在 `PLAN-signin-vip.md` 与 `PLAN-evening-batch.md`。
 
 ---
 
@@ -91,23 +91,23 @@ This repository is a fork of [cmxin24/NetEaseMusicActivator](https://github.com/
 | Addition | Details |
 |---|---|
 | YunBei center check-in + stage rewards | Besides the original `/api/point/dailyTask`, it also calls `pointmall/user/sign` and claims the consecutive sign-in rewards (3 / 7 / 28 days) once reached |
-| Vinyl Music Sign | Daily Music Sign through `vip-center-bff/task/sign`; works without a VIP entitlement. Re-checked after 21:00, with an automatic re-sign when the midnight attempt did not take effect |
+| Vinyl Music Sign | Punches in through the same encrypted eapi call the official client uses (`vip-center-bff/task/sign`); works without a VIP entitlement. Re-checked after 21:00, with an automatic re-sign when the punch did not take effect |
 | YunBei task rewards | Claims completed YunBei task rewards (e.g. Listen-to-Roaming) through `usertool/task/todo/query` + `usertool/task/point/receive`, one by one, in the 21:00–23:59 batch; only claims finished tasks, never performs them |
 | VIP growth points | Claims everything pending through `vipnewcenter/app/level/task/reward/getall`, only between 21:00–23:59 local time, at most once per day |
-| weapi crypto layer | Those endpoints only accept weapi payloads. `weapi.js` implements them with WebCrypto (AES-128-CBC) plus BigInt raw RSA — **no third-party dependencies**, no crypto-js / node-forge |
+| weapi / eapi crypto layer | Those endpoints only accept encrypted payloads. `weapi.js` uses WebCrypto (AES-128-CBC) plus BigInt raw RSA; `eapi.js` implements MD5 + AES-128-ECB in pure JS (WebCrypto has no ECB). **No third-party dependencies**, no crypto-js / node-forge |
 | Offline tests | `node --test`: byte-for-byte comparison of the crypto layer against an independent implementation, plus stubbed scheduling assertions |
 
 Two deliberate trade-offs:
 
 - **Chromium / Edge builds only.** The Firefox build branch was removed; the listing on addons.mozilla.org is still the upstream release and does not contain these features.
-- **Why the evening batch runs after 21:00.** YunBei task rewards and growth points need daytime progress, and Music Sign switches its sign day later than midnight — punching right after 00:00 can land on the previous day. So the Music Sign re-check/re-sign, the YunBei task rewards and the growth claim all run only between 21:00–23:59, once a day. Missing one evening: growth points and YunBei rewards are picked up in the next window; a missed Music Sign evening is a lost streak day.
+- **Why the evening batch runs after 21:00.** YunBei task rewards and growth points need daytime progress, and the Music Sign punch can be silently dropped by the server (a success ack without an actual sign-in) — an evening re-check is what catches that. So the Music Sign re-check/re-sign, the YunBei task rewards and the growth claim all run only between 21:00–23:59, once a day. Missing one evening: growth points and YunBei rewards are picked up in the next window; a missed Music Sign evening is a lost streak day.
 
 Still GPL-3.0, same as upstream; all changes in this fork are open under GPL-3.0 as well.
 
 ## Key Features
 
 - **Daily Check-in**: Completes both the web check-in and the YunBei (云贝) center check-in, and claims consecutive sign-in rewards once reached (3 / 7 / 28 days).
-- **Vinyl Music Sign (黑胶乐签)**: Signs the daily Music Sign check-in automatically; works without a VIP entitlement. Re-checked in the evening, with an automatic re-sign when the midnight attempt did not take effect.
+- **Vinyl Music Sign (黑胶乐签)**: Completes the daily Music Sign punch through the same eapi call the official client uses; works without a VIP entitlement. Re-checked in the evening, with an automatic re-sign when it did not take effect.
 - **YunBei Task Rewards**: Claims completed YunBei task rewards (e.g. Listen-to-Roaming) one by one between 21:00–23:59. Only finished tasks are claimed — the extension never performs the tasks themselves.
 - **VIP Growth Points**: Claims finished growth-task rewards once a day between 21:00–23:59 local time. Points never expire — a missed evening is picked up in the next window.
 - **Login Reminder**: If user has not logged in yet, will show a notification. Will switch to the opened webpage when user click it.
