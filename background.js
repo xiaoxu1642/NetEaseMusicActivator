@@ -1,4 +1,4 @@
-importScripts("weapi.js", "eapi.js");
+importScripts("weapi.js");
 
 const TARGET_URL = "https://music.163.com/";
 const BUFFER_TIME_MS = 2000;
@@ -281,37 +281,12 @@ async function claimYunbeiTasks() {
     };
 }
 
-// 乐签打卡只认"客户端形态"的 eapi 请求：设备身份 cookie + e_r:true + x-aeapi（2026-10-06 实测；
-// 走 weapi 的同名路径会返回成功但不落签）。身份值对齐参考实现桌面工具的 EAPI 档默认配置。
-const VIP_SIGN_IDENTITY = {
-    channel: "netease",
-    ntes_kaola_ad: "1",
-    WEVNSM: "1.0",
-    appver: "9.2.85",
-    os: "android",
-    osver: "9",
-    buildver: "250418145357",
-    resolution: "1600x900",
-    mobilename: "SM-S9180",
-    brand: "samsung",
-    versioncode: "9002085",
-    packageType: "release"
-};
-
-async function ensureVipSignIdentityCookies() {
-    const hexChars = "0123456789ABCDEF";
-    let deviceId = "";
-    for (let i = 0; i < 52; i++) deviceId += hexChars[Math.floor(Math.random() * 16)];
-
-    const cookies = { ...VIP_SIGN_IDENTITY, deviceId };
-    await Promise.all(Object.entries(cookies).map(([name, value]) => new Promise((resolve) => {
-        chrome.cookies.set({ url: "https://music.163.com/", domain: ".music.163.com", name, value, path: "/" }, () => resolve());
-    })));
-}
-
+// 乐签打卡用 weapi 形态（interface3 + csrf）。这是唯一有落签实证的形态：
+// 10-05 12:07:30、10-06 00:08:07 两条乐签记录的 time 与它逐秒对应。
+// 客户端同款 eapi 形态只翻转任务态（task/list 变「已打卡」、今日成长值 +3），不生成乐签记录行，
+// 而且任务态一旦置为已打卡，当天再打只是空转 —— 2026-10-06 晚改道 eapi 因此是回归，已回退。
 async function requestVipSignPunch() {
-    await ensureVipSignIdentityCookies();
-    return eapiRequest(INTERFACE_HOST, "/api/vip-center-bff/task/sign", { e_r: true, header: "{}" });
+    return weapiRequest(VIP_CENTER_HOST, "/weapi/vip-center-bff/task/sign", {}, await getCookie("__csrf"));
 }
 
 async function fetchVipSignCard() {
@@ -326,7 +301,8 @@ async function fetchVipSignCard() {
 async function signVipMusic() {
     const reply = await requestVipSignPunch();
     if (reply.code !== 200) return notLoggedIn(reply.code, "乐签") || rejected(reply.code, "乐签");
-    if (reply.data === true) return { done: true, message: "乐签：打卡请求成功" };
+    // data===true 只代表请求被受理，不代表已落签；终态由 21:00 的卡片复核给出。
+    if (reply.data === true) return { done: true, message: "乐签：打卡请求已受理" };
 
     return { done: true, message: "乐签：本次未完成", details: { reason: reply.message || "" } };
 }
@@ -340,6 +316,8 @@ async function verifyVipSign() {
     if (punch.code !== 200) return notLoggedIn(punch.code, "乐签补打") || rejected(punch.code, "乐签补打");
 
     const after = await fetchVipSignCard();
+    // 补打只在看得到未签时才可能生效：服务端一旦把任务态置为已打卡，当天再打就是空转，
+    // 此时 punchAck=true 而卡片仍未签，说明当天已经救不回来了。
     if (after.signed) return { done: true, message: "乐签复核：凌晨打卡未生效，已补打成功" };
     return { done: true, message: "乐签复核：补打后仍未生效", details: { punchAck: punch.data === true } };
 }

@@ -4,8 +4,6 @@
 // 跑法：node --test（在仓库根目录运行；带目录参数的 node --test tests/ 在 Node 25 下会报 MODULE_NOT_FOUND）
 import test from "node:test";
 import assert from "node:assert/strict";
-import crypto from "node:crypto";
-import zlib from "node:zlib";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -17,7 +15,7 @@ const ROOT = path.resolve(HERE, "..");
 const OK_SIGN = { re: /api\/point\/dailyTask/, body: { code: 200, point: 2 } };
 const OK_YUNBEI = { re: /weapi\/pointmall\/user\/sign\?/, body: { code: 200, data: { sign: true } } };
 const NO_STAGE = { re: /weapi\/pointmall\/user\/sign\/config\?/, body: { code: 200, data: { lotteryConfig: [] } } };
-const EAPI_PUNCH = { re: /eapi\/vip-center-bff\/task\/sign/, body: { code: 200, data: true, message: "" } };
+const OK_PUNCH = { re: /weapi\/vip-center-bff\/task\/sign/, body: { code: 200, data: true, message: "" } };
 const OK_CLAIM = { re: /task\/reward\/getall/, body: { code: 200, data: { result: true } } };
 const OK_TODO = {
     re: /usertool\/task\/todo\/query/,
@@ -41,15 +39,7 @@ const MINIDESK_NOT_SIGNED = {
         data: { signInfoList: [{ dayText: "5日", sign: true, today: false }, { dayText: "6日", sign: false, today: true }] }
     }
 };
-const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, EAPI_PUNCH, OK_TODO, OK_RECEIVE, MINIDESK_SIGNED, OK_CLAIM];
-
-// eapi 响应是 ECB+gzip 的二进制；桩件用 Node 侧独立实现做真实编码，让 eapi.js 的解密路径被真实覆盖。
-const eapiBody = (obj) => {
-    const gzipped = zlib.gzipSync(Buffer.from(JSON.stringify(obj), "utf8"));
-    const cipher = crypto.createCipheriv("aes-128-ecb", Buffer.from("e82ckenh8dichen8"), null);
-    const encrypted = Buffer.concat([cipher.update(gzipped), cipher.final()]);
-    return encrypted.buffer.slice(encrypted.byteOffset, encrypted.byteOffset + encrypted.byteLength);
-};
+const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, OK_PUNCH, OK_TODO, OK_RECEIVE, MINIDESK_SIGNED, OK_CLAIM];
 
 const TODAY = "Mon Oct 05 2026";
 const MORNING_DONE = { dailyTask: TODAY, yunbeiSign: TODAY, yunbeiStage: TODAY, vipSign: TODAY };
@@ -77,10 +67,6 @@ function makeChrome(state) {
             get(query, callback) {
                 const value = state.cookies[query.name];
                 callback(value ? { value } : null);
-            },
-            set(details, callback) {
-                state.cookieSets.push(details);
-                callback && callback({ name: details.name, value: details.value });
             },
         },
         alarms: { create: (name, info) => state.alarms.push({ name, info }), onAlarm: noopListeners },
@@ -115,7 +101,7 @@ function freezeClock(context, hour) {
 }
 
 async function harness({ hour = 9, routes = [], cookies = { MUSIC_U: "u", __csrf: "c" }, store = {}, failOnce } = {}) {
-    const state = { store, cookies, alarms: [], notifications: [], tabs: [], cookieSets: [] };
+    const state = { store, cookies, alarms: [], notifications: [], tabs: [] };
     const calls = [];
     const alreadyFailed = new Set();
     const silentConsole = { log() {}, warn() {}, error() {}, group() {}, groupEnd() {}, table() {} };
@@ -130,7 +116,7 @@ async function harness({ hour = 9, routes = [], cookies = { MUSIC_U: "u", __csrf
         const matched = routes.find((route) => route.re.test(target));
         if (!matched) throw new Error(`测试未桩件化该请求: ${target}`);
         const body = typeof matched.body === "function" ? matched.body(target) : matched.body;
-        return { ok: true, status: 200, json: async () => body, arrayBuffer: async () => eapiBody(body) };
+        return { ok: true, status: 200, json: async () => body };
     };
 
     const context = vm.createContext({
@@ -140,8 +126,6 @@ async function harness({ hour = 9, routes = [], cookies = { MUSIC_U: "u", __csrf
         crypto: globalThis.crypto,
         TextEncoder,
         TextDecoder,
-        Response: globalThis.Response,
-        DecompressionStream: globalThis.DecompressionStream,
         URL,
         URLSearchParams,
         structuredClone,
@@ -154,10 +138,10 @@ async function harness({ hour = 9, routes = [], cookies = { MUSIC_U: "u", __csrf
     freezeClock(context, hour);
 
     const sources = {};
-    for (const file of ["weapi.js", "eapi.js", "background.js"]) {
+    for (const file of ["weapi.js", "background.js"]) {
         sources[file] = await readFile(path.join(ROOT, file), "utf8");
     }
-    // 真实加载路径：background.js 顶层会 importScripts('weapi.js', 'eapi.js')，多个文件共享同一全局词法作用域。
+    // 真实加载路径：background.js 顶层 importScripts('weapi.js')，两个文件共享同一全局词法作用域。
     context.importScripts = (...files) => {
         for (const file of files) vm.runInContext(sources[file], context, { filename: file });
     };
@@ -188,7 +172,7 @@ test("并发触发（onStartup + onInstalled + 迟到的 alarm 同时到）每�
     await h.runConcurrently(3);
 
     const hosts = ["/api/point/dailyTask", "/weapi/pointmall/user/sign?", "/weapi/pointmall/user/sign/config?",
-        "/eapi/vip-center-bff/task/sign", "/weapi/vipnewcenter/app/minidesk/music/sign/pc",
+        "/weapi/vip-center-bff/task/sign", "/weapi/vipnewcenter/app/minidesk/music/sign/pc",
         "/weapi/usertool/task/todo/query", "/weapi/usertool/task/point/receive",
         "/weapi/vipnewcenter/app/level/task/reward/getall"];
     for (const endpoint of hosts) {
@@ -217,7 +201,7 @@ test("窗口内（21:30）跑完整晚批，并落下本地账目", async () => 
     assert.equal(h.calls.filter((url) => /reward\/getall/.test(url)).length, 1, "getall 应恰好调用一次");
     assert.equal(h.calls.filter((url) => /minidesk\/music\/sign\/pc/.test(url)).length, 1, "乐签复核应恰好调用一次");
     assert.equal(h.calls.filter((url) => /task\/point\/receive/.test(url)).length, 1, "completed 的条目逐个领取");
-    assert.equal(h.calls.filter((url) => /eapi\/vip-center-bff\/task\/sign/.test(url)).length, 1,
+    assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 1,
         "复核说今日已签时不得补打，打卡请求全天只有晨批那一次");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
     assert.equal(h.state.store.taskDoneOn.yunbeiTask, TODAY);
@@ -249,7 +233,7 @@ test("连签阶段奖励只领待领的那一档", async () => {
                 },
             },
             { re: /pointmall\/user\/sign\/lottery\/get\?/, body: { code: 200, data: true } },
-            EAPI_PUNCH,
+            OK_PUNCH,
             OK_CLAIM,
         ],
     });
@@ -323,13 +307,11 @@ test("乐签复核：晚间发现凌晨打卡未生效时补打并回读确认",
     });
     await h.run();
 
-    assert.equal(h.calls.filter((url) => /eapi\/vip-center-bff\/task\/sign/.test(url)).length, 2, "晨批试打 + 晚批补打各一次");
+    assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 2, "晨批试打 + 晚批补打各一次");
     assert.equal(minideskReads, 2, "复核读一次 + 补打后回读一次");
     assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("已补打成功")),
         "日志应记录补打结果");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
-    assert.ok(h.state.cookieSets.some((set) => set.name === "deviceId" && /^[0-9A-F]{52}$/.test(set.value)),
-        "打卡前应写入设备身份 cookie");
 });
 
 test("乐签复核：补打后仍未生效时如实记录且当天不再重试", async () => {
@@ -340,11 +322,11 @@ test("乐签复核：补打后仍未生效时如实记录且当天不再重试",
     await h.run();
 
     assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("补打后仍未生效")));
-    assert.equal(h.calls.filter((url) => /eapi\/vip-center-bff\/task\/sign/.test(url)).length, 2);
+    assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 2);
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
 
     await h.run();
-    assert.equal(h.calls.filter((url) => /eapi\/vip-center-bff\/task\/sign/.test(url)).length, 2, "当天不得重复补打");
+    assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 2, "当天不得重复补打");
 });
 
 test("云贝任务：只领 completed 的条目，未完成的不触碰领取接口", async () => {

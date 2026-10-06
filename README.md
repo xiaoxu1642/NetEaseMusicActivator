@@ -15,10 +15,10 @@
 | 新增 | 说明 |
 |---|---|
 | 云贝中心签到 + 连续签到阶段奖励 | 除原有 `/api/point/dailyTask` 外，另走 `pointmall/user/sign` 完成云贝签到，并自动领取已达标（3 / 7 / 28 天）的阶段奖励 |
-| 黑胶乐签 | 打卡走客户端同款 eapi 加密请求（`vip-center-bff/task/sign`），无会员权益也可签到；21:00 后自动复核，未签上时补打 |
+| 黑胶乐签 | 打卡走 `vip-center-bff/task/sign` 的 weapi 加密请求，无会员权益也可签到；21:00 后按日历卡片复核，未签上时补打 |
 | 云贝任务奖励一键领取 | 走 `usertool/task/todo/query` + `usertool/task/point/receive`，在 21:00–23:59 与成长值同批领取已完成的任务奖励（如听漫游），只领已完成项、不代做任务 |
 | VIP 成长值一键领取 | 走 `vipnewcenter/app/level/task/reward/getall`，只在本地时间 21:00–23:59 触发、每天最多一次 |
-| weapi / eapi 加密层 | 上述接口只接受密文。`weapi.js` 用 WebCrypto（AES-128-CBC）+ BigInt 裸 RSA；`eapi.js` 自实现 MD5 + AES-128-ECB（WebCrypto 不支持 ECB）。**零第三方依赖**，不引入 crypto-js / node-forge |
+| weapi 加密层 | 上述接口只接受密文。`weapi.js` 用 WebCrypto（AES-128-CBC）+ BigInt 裸 RSA 自实现。**零第三方依赖**，不引入 crypto-js / node-forge |
 | 离线测试 | `node --test`：加密层与独立实现逐字节比对，调度门控用桩件验证 |
 
 两点取舍需要说明：
@@ -31,7 +31,7 @@
 ## 主要功能
 
 - **每日签到**：自动完成网页端签到与云贝中心签到，并领取已达标的连续签到奖励（3 天 / 7 天 / 28 天）。
-- **黑胶乐签**：自动完成「黑胶乐签」打卡（走客户端同款 eapi 加密请求），无会员权益也可签到；晚间 21:00 后自动复核，未签上则补打。
+- **黑胶乐签**：自动完成「黑胶乐签」打卡（`vip-center-bff/task/sign`），无会员权益也可签到；晚间 21:00 后按日历卡片复核，未签上则补打。
 - **云贝任务奖励一键领取**：每天 21:00–23:59 把已完成的云贝任务奖励（如听漫游）逐个领取，只领已完成项，不代做任务本身。
 - **VIP 成长值一键领取**：每天 21:00–23:59 之间领取已完成的成长任务奖励，每天只调用一次。成长值不过期，错过当晚会在下一个窗口一并领取。
 - **登录提醒**：如果用户尚未登录，将发送一条通知进行提醒，点击跳转至后台已打开的网页。
@@ -91,10 +91,10 @@ This repository is a fork of [cmxin24/NetEaseMusicActivator](https://github.com/
 | Addition | Details |
 |---|---|
 | YunBei center check-in + stage rewards | Besides the original `/api/point/dailyTask`, it also calls `pointmall/user/sign` and claims the consecutive sign-in rewards (3 / 7 / 28 days) once reached |
-| Vinyl Music Sign | Punches in through the same encrypted eapi call the official client uses (`vip-center-bff/task/sign`); works without a VIP entitlement. Re-checked after 21:00, with an automatic re-sign when the punch did not take effect |
+| Vinyl Music Sign | Punches in through the encrypted `vip-center-bff/task/sign` weapi call; works without a VIP entitlement. Re-checked after 21:00 against the sign calendar, with an automatic re-sign when the punch did not take effect |
 | YunBei task rewards | Claims completed YunBei task rewards (e.g. Listen-to-Roaming) through `usertool/task/todo/query` + `usertool/task/point/receive`, one by one, in the 21:00–23:59 batch; only claims finished tasks, never performs them |
 | VIP growth points | Claims everything pending through `vipnewcenter/app/level/task/reward/getall`, only between 21:00–23:59 local time, at most once per day |
-| weapi / eapi crypto layer | Those endpoints only accept encrypted payloads. `weapi.js` uses WebCrypto (AES-128-CBC) plus BigInt raw RSA; `eapi.js` implements MD5 + AES-128-ECB in pure JS (WebCrypto has no ECB). **No third-party dependencies**, no crypto-js / node-forge |
+| weapi crypto layer | Those endpoints only accept encrypted payloads. `weapi.js` uses WebCrypto (AES-128-CBC) plus BigInt raw RSA, implemented in-house. **No third-party dependencies**, no crypto-js / node-forge |
 | Offline tests | `node --test`: byte-for-byte comparison of the crypto layer against an independent implementation, plus stubbed scheduling assertions |
 
 Two deliberate trade-offs:

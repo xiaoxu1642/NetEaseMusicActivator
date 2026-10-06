@@ -11,7 +11,7 @@
 | 诉求 | 可行性 | 说明 |
 |---|---|---|
 | 图一 · 每日签到 | ✅ 已存在，需补强 | `background.js:151-186` 已在做 `/api/point/dailyTask?type=1`（经验/积分签到）。图一红框左侧其实是**云贝中心签到 + 连签阶段奖励（3天/7天/28天）**，这是另一条接口链，目前完全没做。 |
-| 图一 · 乐签签到（黑胶乐签） | ✅ 可做 | `weapi/vip-center-bff/task/sign`，打卡返回 `data===true` 即成功；日历/成长值用 `vipnewcenter/app/user/sign/info` 与 `minidesk/music/sign/pc` 读取。 |
+| 图一 · 乐签签到（黑胶乐签） | ✅ 可做 | `weapi/vip-center-bff/task/sign` 打卡；⚠️ 返回 `data===true` **只代表请求被受理，不等于已落签**（实测过只翻任务态、不生成记录的情形），终态须回读 `minidesk/music/sign/pc` 卡片的 `sign`。日历/成长值用 `vipnewcenter/app/user/sign/info` 与 `minidesk/music/sign/pc` 读取。 |
 | 图二 · VIP 成长任务「一键领取 +81」 | ✅ 可做 | 官方就有 `weapi/vipnewcenter/app/level/task/reward/getall`，一次调用等价于点那个按钮。**按 2026-10-05 决定：仅在本地时间 21:00–23:59 窗口触发、每天最多调用一次、成功即落本地账目**（理由：部分成长任务靠白天听歌累积进度，领早了没东西可领）。详见 §5.4。 |
 | 图二 · 自动**完成**成长任务（设置开机启动图 / 红心 3 首 VIP 单曲） | ⚠️ 部分可做，**默认不做** | 「红心」可用 `/weapi/playlist/manipulate/tracks` 做到，但它会改写用户「我喜欢的音乐」列表；「设置开机启动图」是 PC 客户端本地设置，无 Web 接口 → **不可自动化**。详见 §3.1。 |
 
@@ -74,7 +74,7 @@
 
 | 步骤 | weapi 路径 | Host | 请求体 | 判定 | 协议来源 |
 |---|---|---|---|---|---|
-| ① 打卡 | `/weapi/vip-center-bff/task/sign` | `interface3.music.163.com` | `{}`（Go 侧 URL 尾部带空值 `?isNew=`） | `code===200 && data===true` 成功；`data===false` 时读 `message` 文案。⚠️ **2026-10-06 实测更正：weapi 形态返回成功但服务端不落签（"假成功"），须用客户端同款 eapi 形态（设备身份 cookie + `e_r:true` + `x-aeapi`），详见 `PLAN-evening-batch.md` 补充节** | Go `api/weapi/vip.go:1311`；eapi 等价 `api/eapi/vip.go:68-97`；Node `module/vip_sign.js:4-11` |
+| ① 打卡 | `/weapi/vip-center-bff/task/sign` | `interface3.music.163.com` | `{}`（Go 侧 URL 尾部带空值 `?isNew=`） | `code===200 && data===true` 只表示**请求被受理**；`data===false` 时读 `message` 文案。⚠️ **是否落签不得据此判定**：`data:true` 仅翻转任务态（`vip-center-bff/task/list` 的乐签条目变 `status:100`、今日成长值 +3），终态看 ③ 卡片或 ② 的 `recordId>0`。且任务态一旦置为已打卡，当天再打只是空转 —— 详见 `PLAN-evening-batch.md` 补充节 | Go `api/weapi/vip.go:1311`；eapi 等价 `api/eapi/vip.go:68-97`（**该形态实测只翻任务态、不生成记录，已弃用**）；Node `module/vip_sign.js:4-11` |
 | ② 打卡信息 | `/weapi/vipnewcenter/app/user/sign/info` | `interface3.music.163.com` | `{}` | ~~`data[].today===true` 表示今天已签~~；`score` 为成长值。⚠️ **更正（2026-10-06）：`today` 只是"当日格子"标记，非已签判定；已签看 minidesk 卡片 `signInfoList[].sign`，详见 `PLAN-evening-batch.md` 补充节** | Go `vip.go:593`、`585`；Node `module/vip_sign_info.js:7` |
 | ③ 日历卡片（展示用） | `/weapi/vipnewcenter/app/minidesk/music/sign/pc` | `interface3.music.163.com` | `{"type":"0"}` 或 `{"type":"1"}` | `data.text/subText/btnText`、`data.signInfoList[]{dayText,sign,today,signTime,songCoverUrl}` | Go `vip.go:1503`；eapi 版 `api/eapi/vip.go:383-444` |
 | ④ 当月累计/节点奖 | `/weapi/vipnewcenter/app/level/user/checkin/history/detail` | `interface3.music.163.com` | `{"type":"1","signDayTime":"<Date.now()>"}` | `monthCheckInTotalDay`、`monthCheckInPrizList[].day`（7/14/28 节点）；**服务端字段拼写就是 `prizList`** | Go `vip.go:1434`；eapi 版 `api/eapi/vip.go:286-381` |
@@ -383,10 +383,11 @@ node --test          # 18 项，全程不联网、不碰 chrome.*
 |---|---|---|---|
 | 1 | 扩展 service worker 发出的 weapi 请求（无 `Referer`、`Origin: chrome-extension://…`、`Sec-Fetch-Site: none`）是否被网易风控拦截 | 曾是 P0/P1 阻塞性风险 | ✅ **已验，2026-10-05 13:50 真机运行**：`pointmall/user/sign`、`sign/config`、`interface3.../vip-center-bff/task/sign` 三个 weapi 端点全部返回 `code:200` 并被正确解出，`Referer`/`UA` 不需要伪造，`declarativeNetRequest` / `scripting` 退路均不必启用。 |
 | 2 | `pointmall/user/sign` 等接口是否也接受现有那种明文 `/api/` POST | 若接受，P1 可以完全不写加密 | 未探（按 weapi 实现已完成，无必要） |
-| 3 | 乐签对非黑胶 VIP 账号返回什么 | 影响日志文案 | ✅ **已验**：验证时所用账号 `vip-center-bff/task/sign` 返回 `code:200 + data:true`，日志「乐签成功」，与 Go 侧「Music Sign 不要求 VIP 权益」的注释一致 |
+| 3 | 乐签对非黑胶 VIP 账号返回什么 | 影响日志文案 | ⏳ **未验**：当时用的账号本身就是 SVIP（`growhpoint/basic` 返回 `vipType:300`、`levelName:"SVIP黑胶·柒"`），所谓"已验"只是 `code:200 + data:true` 的回执，而该回执并不等价于落签（见 #7）。Go 侧「Music Sign 不要求 VIP 权益」的注释仍按未证事实对待 |
 | 4 | `reward/getall` 的返回形态 | P2 判定依据 | ✅ **成功路径已验**（2026-10-05 22:56 真机）：返回 `code:200 + data.result === true`，日志「VIP 成长值：领取成功」，与 Go 结构体一致。⏳ 非会员 / 已满级 / 达本月 300·400 上限三种分支仍未验（验证时所用账号是有权益且未满级），但这三条只影响日志文案，不影响正确性 —— 未知 `code` 一律归到"记日志、不重试" |
 | 5 | 满勤签到抽奖 `extraLotteryId` 的领取语义 | 少一个可选奖励 | 本期不做（Go 项目自己也是 Pending，`sign.go:146`） |
-| 6 | 连签阶段奖励是否存在"必须手动点领奖"的时间窗 | 可能漏领 | ✅ 部分已验：本机 `sign/config` 返回 200 且无待领项，日志「云贝连签奖励：无待领」 |
+| 6 | 连签阶段奖励是否存在"必须手动点领奖"的时间窗 | 可能漏领 | ✅ 部分已验：本机 `sign/config` 返回 200 且无待领项，日志「云贝连签奖励：无待领」（10-07 00:01 首次真领到：`已领取 1/1`） |
+| 7 | `task/sign` 的 `data:true` 到底代表什么 | 决定成功判据 | ✅ **已验（2026-10-07 凌晨）**：只代表任务态被翻转（`vip-center-bff/task/list` 乐签条目 `status:100`、`growhpoint/basic` 的 `todayScore` +3），**不保证生成乐签记录行**。eapi 形态即"翻了任务态但 `recordId` 仍为 0"；且任务态置为已打卡后当天再打只是空转（00:38 用 weapi 重打，`recordId` 不变）。已签的唯一可靠判据是卡片 `signInfoList[].sign` / `sign/info.recordId>0` |
 
 ---
 
