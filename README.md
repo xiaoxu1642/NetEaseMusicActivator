@@ -15,7 +15,8 @@
 | 新增 | 说明 |
 |---|---|
 | 云贝中心签到 + 连续签到阶段奖励 | 除原有 `/api/point/dailyTask` 外，另走 `pointmall/user/sign` 完成云贝签到，并自动领取已达标（3 / 7 / 28 天）的阶段奖励 |
-| 黑胶乐签 | 走 `vip-center-bff/task/sign` 完成每日乐签打卡，无会员权益也可签到 |
+| 黑胶乐签 | 走 `vip-center-bff/task/sign` 完成每日乐签打卡，无会员权益也可签到；21:00 后自动复核，凌晨打卡未生效时补打 |
+| 云贝任务奖励一键领取 | 走 `usertool/task/todo/query` + `usertool/task/point/receive`，在 21:00–23:59 与成长值同批领取已完成的任务奖励（如听漫游），只领已完成项、不代做任务 |
 | VIP 成长值一键领取 | 走 `vipnewcenter/app/level/task/reward/getall`，只在本地时间 21:00–23:59 触发、每天最多一次 |
 | weapi 加密层 | 上述接口只接受 weapi 密文。`weapi.js` 用 WebCrypto（AES-128-CBC）+ BigInt 裸 RSA 实现，**零第三方依赖**，不引入 crypto-js / node-forge |
 | 离线测试 | `node --test`：加密层与独立实现逐字节比对，调度门控用桩件验证 |
@@ -23,14 +24,15 @@
 两点取舍需要说明：
 
 - **只产出 Chromium / Edge 构建**。Firefox 的构建分支已移除，addons.mozilla.org 上仍是上游旧版，不含上述功能。
-- **成长值为什么定在晚上领**。部分成长任务要靠白天的听歌进度累积，白天去领往往无值可领，所以该动作只在 21:00–23:59 触发。错过当晚不会损失任何成长值，它会在下一个窗口一并领走。
+- **为什么晚间批定在 21:00 之后**。云贝任务奖励与成长值都要等白天攒进度，白天去领往往无值可领；乐签的签到日切换又晚于凌晨，00:00 刚过就打卡会落到前一天。所以「乐签复核补打 + 云贝任务奖励领取 + 成长值领取」都只在 21:00–23:59 触发，每天各一次。错过当晚：成长值与云贝任务奖励会在下一个窗口一并领走；乐签属签到类，漏一晚即断签一天。
 
 许可证沿用上游的 GPL-3.0，二改代码同样以 GPL-3.0 开源。
 
 ## 主要功能
 
 - **每日签到**：自动完成网页端签到与云贝中心签到，并领取已达标的连续签到奖励（3 天 / 7 天 / 28 天）。
-- **黑胶乐签**：自动完成「黑胶乐签」打卡，无会员权益也可签到。
+- **黑胶乐签**：自动完成「黑胶乐签」打卡，无会员权益也可签到；晚间自动复核，凌晨打卡未生效则补打。
+- **云贝任务奖励一键领取**：每天 21:00–23:59 把已完成的云贝任务奖励（如听漫游）逐个领取，只领已完成项，不代做任务本身。
 - **VIP 成长值一键领取**：每天 21:00–23:59 之间领取已完成的成长任务奖励，每天只调用一次。成长值不过期，错过当晚会在下一个窗口一并领取。
 - **登录提醒**：如果用户尚未登录，将发送一条通知进行提醒，点击跳转至后台已打开的网页。
 - **定时执行**：如果浏览器未打开或处于休眠状态，将在下一次打开时执行。
@@ -52,7 +54,7 @@ Firefox用户请点击下方链接跳转至Firefox Add-ons Store, 点击右侧�
 
 1. **登录账号**：先在 [网易云音乐官网 (music.163.com)](https://music.163.com/) 中**登录**您的账号。
 2. **自动运行**：扩展程序会自动读取您的登录状态（Cookies），并在后台自动进行每日的签到任务。
-3. **成长值领取时间**：成长值在 21:00–23:59 之间领取，因为部分任务要靠白天的听歌进度累积；这段时间内浏览器需要处于打开状态（当天错过不影响下次领取，成长值会累积）。
+3. **晚间批时间**：乐签复核补打、云贝任务奖励领取、成长值领取都在 21:00–23:59 之间进行（云贝签到与乐签的首次打卡仍在每天首次运行扩展时完成）；这段时间内浏览器需要处于打开状态。成长值与云贝任务奖励错过当晚可在下一次窗口补领，乐签漏签一晚无法补。
 4. **状态切换**：不需要时点击logo即可停用，logo将自动切换为灰色。
 
 ## 隐私说明
@@ -89,7 +91,8 @@ This repository is a fork of [cmxin24/NetEaseMusicActivator](https://github.com/
 | Addition | Details |
 |---|---|
 | YunBei center check-in + stage rewards | Besides the original `/api/point/dailyTask`, it also calls `pointmall/user/sign` and claims the consecutive sign-in rewards (3 / 7 / 28 days) once reached |
-| Vinyl Music Sign | Daily Music Sign through `vip-center-bff/task/sign`; works without a VIP entitlement |
+| Vinyl Music Sign | Daily Music Sign through `vip-center-bff/task/sign`; works without a VIP entitlement. Re-checked after 21:00, with an automatic re-sign when the midnight attempt did not take effect |
+| YunBei task rewards | Claims completed YunBei task rewards (e.g. Listen-to-Roaming) through `usertool/task/todo/query` + `usertool/task/point/receive`, one by one, in the 21:00–23:59 batch; only claims finished tasks, never performs them |
 | VIP growth points | Claims everything pending through `vipnewcenter/app/level/task/reward/getall`, only between 21:00–23:59 local time, at most once per day |
 | weapi crypto layer | Those endpoints only accept weapi payloads. `weapi.js` implements them with WebCrypto (AES-128-CBC) plus BigInt raw RSA — **no third-party dependencies**, no crypto-js / node-forge |
 | Offline tests | `node --test`: byte-for-byte comparison of the crypto layer against an independent implementation, plus stubbed scheduling assertions |
@@ -97,14 +100,15 @@ This repository is a fork of [cmxin24/NetEaseMusicActivator](https://github.com/
 Two deliberate trade-offs:
 
 - **Chromium / Edge builds only.** The Firefox build branch was removed; the listing on addons.mozilla.org is still the upstream release and does not contain these features.
-- **Why growth points are claimed in the evening.** Some growth tasks only progress while you listen during the day, so claiming earlier usually claims nothing. Missing one evening costs nothing — the points accumulate and are picked up in the next window.
+- **Why the evening batch runs after 21:00.** YunBei task rewards and growth points need daytime progress, and Music Sign switches its sign day later than midnight — punching right after 00:00 can land on the previous day. So the Music Sign re-check/re-sign, the YunBei task rewards and the growth claim all run only between 21:00–23:59, once a day. Missing one evening: growth points and YunBei rewards are picked up in the next window; a missed Music Sign evening is a lost streak day.
 
 Still GPL-3.0, same as upstream; all changes in this fork are open under GPL-3.0 as well.
 
 ## Key Features
 
 - **Daily Check-in**: Completes both the web check-in and the YunBei (云贝) center check-in, and claims consecutive sign-in rewards once reached (3 / 7 / 28 days).
-- **Vinyl Music Sign (黑胶乐签)**: Signs the daily Music Sign check-in automatically; works without a VIP entitlement.
+- **Vinyl Music Sign (黑胶乐签)**: Signs the daily Music Sign check-in automatically; works without a VIP entitlement. Re-checked in the evening, with an automatic re-sign when the midnight attempt did not take effect.
+- **YunBei Task Rewards**: Claims completed YunBei task rewards (e.g. Listen-to-Roaming) one by one between 21:00–23:59. Only finished tasks are claimed — the extension never performs the tasks themselves.
 - **VIP Growth Points**: Claims finished growth-task rewards once a day between 21:00–23:59 local time. Points never expire — a missed evening is picked up in the next window.
 - **Login Reminder**: If user has not logged in yet, will show a notification. Will switch to the opened webpage when user click it.
 - **Scheduled Execution**: If the browser is not open or in sleep mode, it will execute the next time it is opened.
@@ -125,7 +129,7 @@ Firefox users please open the link below to jump to the Firefox Add-ons Store, c
 
 1. **Login**: First, **log in** to your account on the [NetEase Cloud Music official website (music.163.com)](http://music.163.com/).
 2. **Auto Run**: The extension will automatically read your login status (Cookies) and perform the daily check-in task automatically in the background.
-3. **Growth Point Window**: Growth points are claimed between 21:00 and 23:59, because some tasks need daytime listening progress to accumulate. Keep the browser open during that window; missing one evening costs nothing.
+3. **Evening Batch Window**: The Music Sign re-check/re-sign, YunBei task rewards and the growth claim all run between 21:00 and 23:59 (the YunBei sign and the first Music Sign punch still happen on the extension's first run of the day). Keep the browser open during that window. Growth points and YunBei rewards missed one evening are picked up in the next window; a missed Music Sign evening cannot be recovered.
 4. **Status Toggle**: Click the logo to disable it when not needed, and the logo will automatically turn gray.
 
 ## Privacy Policy

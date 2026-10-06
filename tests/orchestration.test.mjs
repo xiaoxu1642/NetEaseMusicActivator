@@ -1,7 +1,7 @@
 // 调度与门控的行为测试：在独立 vm 上下文里加载扩展真身，用 chrome/fetch 桩件离线跑
-// checkAndRun，验证「21:00 硬窗口、每天最多一次、瞬态失败不写门」这些约束真的生效。
+// checkAndRun，验证「21:00 硬窗口、每天最多一次、瞬态失败不写门、乐签只在缺签时补打」这些约束真的生效。
 // 上下文必须独立于宿主 realm：伪造 Date 泄漏到宿主会污染测试进程自身的序列化。
-// 跑法：node --test tests/
+// 跑法：node --test（在仓库根目录运行；带目录参数的 node --test tests/ 在 Node 25 下会报 MODULE_NOT_FOUND）
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -17,10 +17,25 @@ const OK_YUNBEI = { re: /weapi\/pointmall\/user\/sign\?/, body: { code: 200, dat
 const NO_STAGE = { re: /weapi\/pointmall\/user\/sign\/config\?/, body: { code: 200, data: { lotteryConfig: [] } } };
 const OK_VIP_SIGN = { re: /vip-center-bff\/task\/sign/, body: { code: 200, data: true } };
 const OK_CLAIM = { re: /task\/reward\/getall/, body: { code: 200, data: { result: true } } };
-const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, OK_VIP_SIGN, OK_CLAIM];
+const OK_TODO = {
+    re: /usertool\/task\/todo\/query/,
+    body: {
+        code: 200,
+        data: [
+            { completed: true, period: 1, userTaskId: 11, depositCode: 1304, taskPoint: 300, taskName: "听漫游(桩)" },
+            { completed: false, period: 2, userTaskId: 22, depositCode: 1305, taskPoint: 8, taskName: "看视频(桩)" }
+        ]
+    }
+};
+const OK_RECEIVE = { re: /usertool\/task\/point\/receive/, body: { code: 200, data: true } };
+const SIGN_INFO_TODAY = { re: /user\/sign\/info/, body: { code: 200, data: [{ today: true, timeStr: "2026-10-05", score: 3 }] } };
+const SIGN_INFO_MISSING = { re: /user\/sign\/info/, body: { code: 200, data: [{ today: false, timeStr: "2026-10-04", score: 3 }] } };
+const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, OK_VIP_SIGN, OK_TODO, OK_RECEIVE, SIGN_INFO_TODAY, OK_CLAIM];
 
 const TODAY = "Mon Oct 05 2026";
 const MORNING_DONE = { dailyTask: TODAY, yunbeiSign: TODAY, yunbeiStage: TODAY, vipSign: TODAY };
+const NIGHT_DONE = { vipSignCheck: TODAY, yunbeiTask: TODAY, vipGrowth: TODAY };
+const ALL_DONE = { ...MORNING_DONE, ...NIGHT_DONE };
 
 function makeChrome(state) {
     const noopListeners = { addListener() {} };
@@ -145,12 +160,16 @@ test("并发触发（onStartup + onInstalled + 迟到的 alarm 同时到）每�
     await h.runConcurrently(3);
 
     const hosts = ["/api/point/dailyTask", "/weapi/pointmall/user/sign?", "/weapi/pointmall/user/sign/config?",
-        "/weapi/vip-center-bff/task/sign", "/weapi/vipnewcenter/app/level/task/reward/getall"];
+        "/weapi/vip-center-bff/task/sign", "/weapi/vipnewcenter/app/user/sign/info",
+        "/weapi/usertool/task/todo/query", "/weapi/usertool/task/point/receive",
+        "/weapi/vipnewcenter/app/level/task/reward/getall"];
     for (const endpoint of hosts) {
         const hits = h.calls.filter((url) => url.includes(endpoint));
         assert.equal(hits.length, 1, `${endpoint} 被打了几次：${hits.length}`);
     }
     assert.equal(h.state.store.vipGrowthLog.length, 1, "并发触发不得写出两条当日账目");
+    assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
+    assert.equal(h.state.store.taskDoneOn.yunbeiTask, TODAY);
     assert.equal(h.state.store.taskDoneOn.vipGrowth, TODAY);
 });
 
@@ -159,14 +178,21 @@ test("窗口外（09:30）只跑签到批，绝不触碰成长值接口", async 
     await h.run();
     assert.equal(h.calls.length, 4, `期望 4 次请求，实际 ${h.calls.length}`);
     assert.ok(h.calls.every((url) => !/reward\/getall/.test(url)), "窗口外不应调用 getall");
+    assert.ok(h.calls.every((url) => !/usertool\/|user\/sign\/info/.test(url)), "窗口外不应触碰晚间批接口");
     assert.deepEqual(h.state.store.taskDoneOn, MORNING_DONE);
     assert.ok(!("vipGrowth" in h.state.store.taskDoneOn), "窗口外不应写入 vipGrowth 日期门");
 });
 
-test("窗口内（21:30）追加领取一次，并落下本地账目", async () => {
+test("窗口内（21:30）跑完整晚批，并落下本地账目", async () => {
     const h = await harness({ hour: 21, routes: ALL_OK });
     await h.run();
     assert.equal(h.calls.filter((url) => /reward\/getall/.test(url)).length, 1, "getall 应恰好调用一次");
+    assert.equal(h.calls.filter((url) => /user\/sign\/info/.test(url)).length, 1, "乐签复核应恰好调用一次");
+    assert.equal(h.calls.filter((url) => /task\/point\/receive/.test(url)).length, 1, "completed 的条目逐个领取");
+    assert.equal(h.calls.filter((url) => /vip-center-bff\/task\/sign/.test(url)).length, 1,
+        "复核说今日已签时不得补打，打卡请求全天只有晨批那一次");
+    assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
+    assert.equal(h.state.store.taskDoneOn.yunbeiTask, TODAY);
     assert.equal(h.state.store.taskDoneOn.vipGrowth, TODAY);
 
     const log = h.state.store.vipGrowthLog;
@@ -207,10 +233,24 @@ test("连签阶段奖励只领待领的那一档", async () => {
 });
 
 test("当天已领过时，窗口内重启浏览器零请求", async () => {
-    const h = await harness({ hour: 22, routes: ALL_OK, store: { taskDoneOn: { ...MORNING_DONE, vipGrowth: TODAY } } });
+    const h = await harness({ hour: 22, routes: ALL_OK, store: { taskDoneOn: ALL_DONE } });
     await h.run();
     assert.deepEqual(h.calls, [], "全部任务当天已完成时应零请求");
     assert.equal(h.state.store.vipGrowthLog, undefined, "不应重复记账");
+});
+
+test("成长值已领但复核缺门时，晚批仍会运行并只补缺失的任务", async () => {
+    const h = await harness({
+        hour: 22,
+        routes: ALL_OK,
+        store: { taskDoneOn: { ...MORNING_DONE, vipGrowth: TODAY } }
+    });
+    await h.run();
+    assert.equal(h.calls.filter((url) => /user\/sign\/info/.test(url)).length, 1, "复核缺门应触发");
+    assert.equal(h.calls.filter((url) => /usertool\/task\/todo\/query/.test(url)).length, 1, "云贝任务缺门应触发");
+    assert.equal(h.calls.filter((url) => /reward\/getall/.test(url)).length, 0, "已领过的成长值不重复请求");
+    assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
+    assert.equal(h.state.store.taskDoneOn.yunbeiTask, TODAY);
 });
 
 test("同一天重复触发被日期门挡住，各任务整天最多一次网络调用", async () => {
@@ -244,6 +284,65 @@ test("瞬态失败不写日期门，下次触发会重试且不弹登录提醒",
     assert.equal(h.state.store.taskDoneOn.yunbeiSign, TODAY, "重试成功后才写日期门");
 });
 
+test("乐签复核：晚间发现凌晨打卡未生效时补打一次", async () => {
+    const h = await harness({
+        hour: 21,
+        routes: [...ALL_OK.filter((route) => route !== SIGN_INFO_TODAY), SIGN_INFO_MISSING]
+    });
+    await h.run();
+
+    const punches = h.calls.filter((url) => /vip-center-bff\/task\/sign/.test(url));
+    assert.equal(punches.length, 2, "晨批试打 + 晚批补打各一次");
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("已补打成功")),
+        "日志应记录补打结果");
+    assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
+});
+
+test("云贝任务：只领 completed 的条目，未完成的不触碰领取接口", async () => {
+    const h = await harness({
+        hour: 21,
+        routes: ALL_OK.map((route) => route === OK_TODO ? {
+            re: /usertool\/task\/todo\/query/,
+            body: {
+                code: 200,
+                data: [
+                    { completed: true, period: 1, userTaskId: 11, depositCode: 1304, taskPoint: 300 },
+                    { completed: true, period: 1, userTaskId: 12, depositCode: 1304, taskPoint: 50 },
+                    { completed: false, period: 2, userTaskId: 22, depositCode: 1305, taskPoint: 8 }
+                ]
+            }
+        } : route)
+    });
+    await h.run();
+    assert.equal(h.calls.filter((url) => /task\/point\/receive/.test(url)).length, 2, "两条 completed 各领一次");
+});
+
+test("云贝任务：全部未完成时零领取调用且当天不再重试", async () => {
+    const h = await harness({
+        hour: 21,
+        routes: ALL_OK.map((route) => route === OK_TODO ? {
+            re: /usertool\/task\/todo\/query/,
+            body: { code: 200, data: [{ completed: false, period: 1, userTaskId: 11, depositCode: 1304 }] }
+        } : route)
+    });
+    await h.run();
+    assert.equal(h.calls.filter((url) => /task\/point\/receive/.test(url)).length, 0);
+    assert.equal(h.state.store.taskDoneOn.yunbeiTask, TODAY, "无待领也是明确结论，写入日期门");
+});
+
+test("云贝任务列表请求瞬态失败不写日期门，当晚下一次触发重试", async () => {
+    const h = await harness({ hour: 21, routes: ALL_OK, failOnce: /usertool\/task\/todo\/query/ });
+
+    await h.run();
+    assert.ok(!("yunbeiTask" in h.state.store.taskDoneOn), "失败的请求不应写入日期门");
+    assert.equal(h.state.store.taskDoneOn.vipGrowth, TODAY, "同批其它任务应照常完成");
+
+    await h.run();
+    const attempts = h.calls.filter((url) => /usertool\/task\/todo\/query/.test(url)).length;
+    assert.equal(attempts, 2, "云贝任务应在下次触发时重试");
+    assert.equal(h.state.store.taskDoneOn.yunbeiTask, TODAY, "重试成功后才写日期门");
+});
+
 test("接口返回 301 时中止整批并提醒登录，不写日期门", async () => {
     const h = await harness({ hour: 9, routes: [{ re: /api\/point\/dailyTask/, body: { code: 301 } }, ...ALL_OK.slice(1)] });
     await h.run();
@@ -272,7 +371,7 @@ test("窗口内触发后，领取 alarm 顺延到次日 21:00，当晚不再重�
     assert.equal(next.getDate(), 6, "应排到明天，避免当晚再触发一次");
 });
 
-test("shouldRunNight 的边界就是 21:00 与当天日期门", async () => {
+test("shouldRunNight 的边界：21:00 起、且晚批只要还有缺门就要跑", async () => {
     const h = await harness({ hour: 9, routes: [] });
     const today = h.evaluate("new Date(2026, 9, 5).toDateString()");
     const cases = [
@@ -280,7 +379,9 @@ test("shouldRunNight 的边界就是 21:00 与当天日期门", async () => {
         ["21:00:00", "new Date(2026, 9, 5, 21, 0, 0)", "{}", true],
         ["23:59:59", "new Date(2026, 9, 5, 23, 59, 59)", "{}", true],
         ["次日 00:00", "new Date(2026, 9, 6, 0, 0, 1)", "{}", false],
-        ["当天已领", "new Date(2026, 9, 5, 22, 0, 0)", `{ vipGrowth: ${JSON.stringify(today)} }`, false],
+        ["只领了成长值", "new Date(2026, 9, 5, 22, 0, 0)", `{ vipGrowth: ${JSON.stringify(today)} }`, true],
+        ["晚批三项全完成", "new Date(2026, 9, 5, 22, 0, 0)",
+            `{ vipSignCheck: ${JSON.stringify(today)}, yunbeiTask: ${JSON.stringify(today)}, vipGrowth: ${JSON.stringify(today)} }`, false],
     ];
     for (const [label, dateExpr, doneOnExpr, expected] of cases) {
         assert.equal(h.evaluate(`shouldRunNight(${dateExpr}, ${doneOnExpr})`), expected, `${label} 判定错误`);

@@ -3,6 +3,7 @@ importScripts("weapi.js");
 const TARGET_URL = "https://music.163.com/";
 const BUFFER_TIME_MS = 2000;
 const ALARM_NAME = "smartDailyNetEaseCheck";
+// 晚间批共用这一个闹钟：乐签复核补打 + 云贝任务奖励领取 + 成长值领取（21:00–23:59 硬窗口）。
 const ALARM_VIP_CLAIM = "netEaseVipGrowthClaim";
 const LOGIN_NOTIFICATION_ID = "netease_login_needed";
 const LOG_STORAGE_KEY = "runtimeLogs";
@@ -13,7 +14,7 @@ const MUSIC_HOST = "music.163.com";
 const INTERFACE_HOST = "interface.music.163.com";
 const VIP_CENTER_HOST = "interface3.music.163.com";
 
-// 成长值要等白天听歌类任务攒够进度才有东西可领，所以领取动作固定在本地时间 21:00 之后。
+// 乐签的签到日边界晚于凌晨；云贝任务奖励与成长值都要等白天攒进度，所以这些动作固定在本地时间 21:00 之后。
 const VIP_CLAIM_HOUR = 21;
 const TASK_STATE_KEY = "taskDoneOn";
 const VIP_GROWTH_LOG_KEY = "vipGrowthLog";
@@ -179,13 +180,13 @@ function scheduleNextRun() {
 }
 
 /**
- * Schedule the growth-point claim for the next 21:00 local
+ * Schedule the evening batch (sign verify / yunbei tasks / growth claim) for the next 21:00 local
  */
 function scheduleVipClaim() {
     const nextRun = new Date();
     nextRun.setHours(nextRun.getHours() >= VIP_CLAIM_HOUR ? 24 + VIP_CLAIM_HOUR : VIP_CLAIM_HOUR, 0, 0, 0);
     chrome.alarms.create(ALARM_VIP_CLAIM, { when: nextRun.getTime() });
-    logInfo("Next VIP growth claim scheduled at", nextRun.toLocaleString());
+    logInfo("Next evening batch scheduled at", nextRun.toLocaleString());
 }
 
 /**
@@ -253,12 +254,58 @@ async function claimYunbeiStages() {
     return { done: true, message: `云贝连签奖励：已领取 ${claimed}/${pending.length}`, details: { claimed } };
 }
 
+async function claimYunbeiTasks() {
+    const csrfToken = await getCookie("__csrf");
+    const todo = await weapiRequest(MUSIC_HOST, "/weapi/usertool/task/todo/query", {}, csrfToken);
+    if (todo.code !== 200) return notLoggedIn(todo.code, "云贝任务") || rejected(todo.code, "云贝任务");
+
+    const completed = (Array.isArray(todo.data) ? todo.data : [])
+        .filter((task) => task && task.completed === true);
+    if (completed.length === 0) return { done: true, message: "云贝任务：无待领" };
+
+    // 官方"一键领取"同样是逐个调 point/receive；只领已完成的任务奖励，不代做任务本身。
+    let claimed = 0;
+    for (const task of completed) {
+        const reply = await weapiRequest(MUSIC_HOST, "/weapi/usertool/task/point/receive", {
+            period: String(task.period),
+            userTaskId: String(task.userTaskId),
+            depositCode: String(task.depositCode)
+        }, csrfToken);
+        if (reply.code === 200 && reply.data === true) claimed++;
+    }
+
+    return {
+        done: true,
+        message: `云贝任务：已领取 ${claimed}/${completed.length} 项`,
+        details: { claimed, total: completed.length }
+    };
+}
+
 async function signVipMusic() {
     const data = await weapiRequest(VIP_CENTER_HOST, "/weapi/vip-center-bff/task/sign", {}, await getCookie("__csrf"));
     if (data.code !== 200) return notLoggedIn(data.code, "乐签") || rejected(data.code, "乐签");
-    if (data.data === true) return { done: true, message: "乐签成功" };
+    // 凌晨打卡可能落到前一天（乐签签到日边界晚于 00:00），这里只表示请求被受理，终态看晚间复核。
+    if (data.data === true) return { done: true, message: "乐签：打卡请求成功" };
 
     return { done: true, message: "乐签：本次未完成", details: { reason: data.message || data.msg || "" } };
+}
+
+async function verifyVipSign() {
+    const csrfToken = await getCookie("__csrf");
+    const info = await weapiRequest(VIP_CENTER_HOST, "/weapi/vipnewcenter/app/user/sign/info", {}, csrfToken);
+    if (info.code !== 200) return notLoggedIn(info.code, "乐签复核") || rejected(info.code, "乐签复核");
+
+    const rows = Array.isArray(info.data) ? info.data : [];
+    if (rows.some((row) => row && row.today === true)) {
+        return { done: true, message: "乐签复核：今日已签" };
+    }
+
+    const punch = await weapiRequest(VIP_CENTER_HOST, "/weapi/vip-center-bff/task/sign", {}, csrfToken);
+    if (punch.code !== 200) return notLoggedIn(punch.code, "乐签补打") || rejected(punch.code, "乐签补打");
+
+    return punch.data === true
+        ? { done: true, message: "乐签复核：凌晨打卡未生效，已补打成功" }
+        : { done: true, message: "乐签复核：补打未完成", details: { reason: punch.message || punch.msg || "" } };
 }
 
 async function claimVipGrowth() {
@@ -311,11 +358,15 @@ const TASKS = [
     { key: "yunbeiSign", batch: "morning", run: signYunbei },
     { key: "yunbeiStage", batch: "morning", run: claimYunbeiStages },
     { key: "vipSign", batch: "morning", run: signVipMusic },
+    { key: "vipSignCheck", batch: "night", run: verifyVipSign },
+    { key: "yunbeiTask", batch: "night", run: claimYunbeiTasks },
     { key: "vipGrowth", batch: "night", run: claimVipGrowth }
 ];
 
 function shouldRunNight(now, doneOn) {
-    return now.getHours() >= VIP_CLAIM_HOUR && doneOn.vipGrowth !== localDate(now);
+    if (now.getHours() < VIP_CLAIM_HOUR) return false;
+    const today = localDate(now);
+    return TASKS.filter((item) => item.batch === "night").some((item) => doneOn[item.key] !== today);
 }
 
 /**
