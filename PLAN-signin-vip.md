@@ -74,8 +74,8 @@
 
 | 步骤 | weapi 路径 | Host | 请求体 | 判定 | 协议来源 |
 |---|---|---|---|---|---|
-| ① 打卡 | `/weapi/vip-center-bff/task/sign` | `interface3.music.163.com` | `{}`（Go 侧 URL 尾部带空值 `?isNew=`） | `code===200 && data===true` 只表示**请求被受理**；`data===false` 时读 `message` 文案。⚠️ **是否落签不得据此判定**：`data:true` 仅翻转任务态（`vip-center-bff/task/list` 的乐签条目变 `status:100`、今日成长值 +3），终态看 ③ 卡片或 ② 的 `recordId>0`。且任务态一旦置为已打卡，当天再打只是空转 —— 详见 `PLAN-evening-batch.md` 补充节 | Go `api/weapi/vip.go:1311`；eapi 等价 `api/eapi/vip.go:68-97`（**该形态实测只翻任务态、不生成记录，已弃用**）；Node `module/vip_sign.js:4-11` |
-| ② 打卡信息 | `/weapi/vipnewcenter/app/user/sign/info` | `interface3.music.163.com` | `{}` | ~~`data[].today===true` 表示今天已签~~；`score` 为成长值。⚠️ **更正（2026-10-06）：`today` 只是"当日格子"标记，非已签判定；已签看 minidesk 卡片 `signInfoList[].sign`，详见 `PLAN-evening-batch.md` 补充节** | Go `vip.go:593`、`585`；Node `module/vip_sign_info.js:7` |
+| ① 打卡 | `/weapi/vip-center-bff/task/sign` | `interface3.music.163.com` | `{}`（Go 侧 URL 尾部带空值 `?isNew=`） | `code===200 && data===true` 表示**请求被受理，且实测足以落签**；`data===false` 时读 `message` 文案。⚠️ 但**当天不能据此核对**：记录行与卡片都要几小时后才写出，落签判据见 ②。详见 `PLAN-evening-batch.md` v1.2.3 补充节 | Go `api/weapi/vip.go:1311`；eapi 等价 `api/eapi/vip.go:68-97`（10-07 00:01:20 那条记录行即 eapi 形态打的；仓库不做 eapi，故未采用）；Node `module/vip_sign.js:4-11` |
+| ② 打卡信息 | `/weapi/vipnewcenter/app/user/sign/info` | `interface3.music.163.com` | `{}` | `data[]` 按天一行；**已签的唯一判据 = 那一天 `recordId>0 且 songId>0`**，其 `time` 等于打卡那一刻。`today` 只是"当日格子"标记、`score` 是成长值，都不能当已签依据。⚠️ 该行的**写出有数小时滞后**（10-08 00:00:07 打卡，21:00 仍读不到、次日 00:03 才在卡片上见到），故终态只能次日核对 | Go `vip.go:593`、`585`；Node `module/vip_sign_info.js:7` |
 | ③ 日历卡片（展示用） | `/weapi/vipnewcenter/app/minidesk/music/sign/pc` | `interface3.music.163.com` | `{"type":"0"}` 或 `{"type":"1"}` | `data.text/subText/btnText`、`data.signInfoList[]{dayText,sign,today,signTime,songCoverUrl}` | Go `vip.go:1503`；eapi 版 `api/eapi/vip.go:383-444` |
 | ④ 当月累计/节点奖 | `/weapi/vipnewcenter/app/level/user/checkin/history/detail` | `interface3.music.163.com` | `{"type":"1","signDayTime":"<Date.now()>"}` | `monthCheckInTotalDay`、`monthCheckInPrizList[].day`（7/14/28 节点）；**服务端字段拼写就是 `prizList`** | Go `vip.go:1434`；eapi 版 `api/eapi/vip.go:286-381` |
 
@@ -387,7 +387,7 @@ node --test          # 18 项，全程不联网、不碰 chrome.*
 | 4 | `reward/getall` 的返回形态 | P2 判定依据 | ✅ **成功路径已验**（2026-10-05 22:56 真机）：返回 `code:200 + data.result === true`，日志「VIP 成长值：领取成功」，与 Go 结构体一致。⏳ 非会员 / 已满级 / 达本月 300·400 上限三种分支仍未验（验证时所用账号是有权益且未满级），但这三条只影响日志文案，不影响正确性 —— 未知 `code` 一律归到"记日志、不重试" |
 | 5 | 满勤签到抽奖 `extraLotteryId` 的领取语义 | 少一个可选奖励 | 本期不做（Go 项目自己也是 Pending，`sign.go:146`） |
 | 6 | 连签阶段奖励是否存在"必须手动点领奖"的时间窗 | 可能漏领 | ✅ 部分已验：本机 `sign/config` 返回 200 且无待领项，日志「云贝连签奖励：无待领」（10-07 00:01 首次真领到：`已领取 1/1`） |
-| 7 | `task/sign` 的 `data:true` 到底代表什么 | 决定成功判据 | ✅ **已验（2026-10-07 凌晨）**：只代表任务态被翻转（`vip-center-bff/task/list` 乐签条目 `status:100`、`growhpoint/basic` 的 `todayScore` +3），**不保证生成乐签记录行**。eapi 形态即"翻了任务态但 `recordId` 仍为 0"；且任务态置为已打卡后当天再打只是空转（00:38 用 weapi 重打，`recordId` 不变）。已签的唯一可靠判据是卡片 `signInfoList[].sign` / `sign/info.recordId>0` |
+| 7 | `task/sign` 的 `data:true` 到底代表什么 | 决定成功判据 | ✅ **已验（2026-10-09 定稿）**：打卡请求本身有效 —— 10-05 12:07:30 / 10-06 00:08:07 / 10-07 00:01:20 / 10-08 00:00:07 四条 `sign/info` 记录行的 `time` 逐秒等于当天的打卡时刻，其中前三天账号侧没有任何手动打卡，weapi 与 eapi 两种形态都落得签。⚠️ 但**记录行和卡片都要几小时后才写出来**，所以当天读到 `recordId=0` / `sign=false` 不能当作"没落签"（10-07 凌晨据此得出的"只翻任务态、当天无法补回"已作废）。落签判据 = `sign/info` 里那一天 `recordId>0 且 songId>0`，终态只能次日核对。详见 `PLAN-evening-batch.md` 的 v1.2.3 补充节 |
 
 ---
 

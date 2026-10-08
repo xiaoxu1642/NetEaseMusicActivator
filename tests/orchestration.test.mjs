@@ -28,21 +28,32 @@ const OK_TODO = {
     }
 };
 const OK_RECEIVE = { re: /usertool\/task\/point\/receive/, body: { code: 200, data: true } };
-const MINIDESK_SIGNED = {
-    re: /minidesk\/music\/sign\/pc/,
-    body: { code: 200, data: { signInfoList: [{ dayText: "6日", sign: true, today: true }] } }
-};
-const MINIDESK_NOT_SIGNED = {
-    re: /minidesk\/music\/sign\/pc/,
+// 落签的唯一判据是 sign/info 里那一天的 recordId>0 且有 songId；minidesk 卡片会滞后数小时，已不再使用。
+// 冻结的时钟是 2026-10-05，所以"今天"= 2026-10-05，晨批终态核对的"昨天"= 2026-10-04。
+const SIGN_INFO_LANDED = {
+    re: /vipnewcenter\/app\/user\/sign\/info/,
     body: {
         code: 200,
-        data: { signInfoList: [{ dayText: "5日", sign: true, today: false }, { dayText: "6日", sign: false, today: true }] }
+        data: [
+            { timeStr: "2026-10-05", recordId: 733, songId: 42, score: 3, today: true },
+            { timeStr: "2026-10-04", recordId: 732, songId: 43, score: 3, today: false }
+        ]
     }
 };
-const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, OK_PUNCH, OK_TODO, OK_RECEIVE, MINIDESK_SIGNED, OK_CLAIM];
+const SIGN_INFO_EMPTY_TODAY = {
+    re: /vipnewcenter\/app\/user\/sign\/info/,
+    body: {
+        code: 200,
+        data: [
+            { timeStr: "2026-10-05", recordId: 0, songId: 0, score: 3, today: true },
+            { timeStr: "2026-10-04", recordId: 732, songId: 43, score: 3, today: false }
+        ]
+    }
+};
+const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, SIGN_INFO_LANDED, OK_PUNCH, OK_TODO, OK_RECEIVE, OK_CLAIM];
 
 const TODAY = "Mon Oct 05 2026";
-const MORNING_DONE = { dailyTask: TODAY, yunbeiSign: TODAY, yunbeiStage: TODAY, vipSign: TODAY };
+const MORNING_DONE = { dailyTask: TODAY, yunbeiSign: TODAY, yunbeiStage: TODAY, vipSignFinal: TODAY, vipSign: TODAY };
 const NIGHT_DONE = { vipSignCheck: TODAY, yunbeiTask: TODAY, vipGrowth: TODAY };
 const ALL_DONE = { ...MORNING_DONE, ...NIGHT_DONE };
 
@@ -171,13 +182,20 @@ test("并发触发（onStartup + onInstalled + 迟到的 alarm 同时到）每�
     const h = await harness({ hour: 21, routes: ALL_OK });
     await h.runConcurrently(3);
 
-    const hosts = ["/api/point/dailyTask", "/weapi/pointmall/user/sign?", "/weapi/pointmall/user/sign/config?",
-        "/weapi/vip-center-bff/task/sign", "/weapi/vipnewcenter/app/minidesk/music/sign/pc",
-        "/weapi/usertool/task/todo/query", "/weapi/usertool/task/point/receive",
-        "/weapi/vipnewcenter/app/level/task/reward/getall"];
-    for (const endpoint of hosts) {
+    // sign/info 是只读核对，晨批核昨日 + 晚批核今日各读一次；其余（含打卡）全天各一次。
+    const expectedHits = {
+        "/api/point/dailyTask": 1,
+        "/weapi/pointmall/user/sign?": 1,
+        "/weapi/pointmall/user/sign/config?": 1,
+        "/weapi/vip-center-bff/task/sign": 1,
+        "/weapi/vipnewcenter/app/user/sign/info": 2,
+        "/weapi/usertool/task/todo/query": 1,
+        "/weapi/usertool/task/point/receive": 1,
+        "/weapi/vipnewcenter/app/level/task/reward/getall": 1
+    };
+    for (const [endpoint, times] of Object.entries(expectedHits)) {
         const hits = h.calls.filter((url) => url.includes(endpoint));
-        assert.equal(hits.length, 1, `${endpoint} 被打了几次：${hits.length}`);
+        assert.equal(hits.length, times, `${endpoint} 被打了几次：${hits.length}，期望 ${times}`);
     }
     assert.equal(h.state.store.vipGrowthLog.length, 1, "并发触发不得写出两条当日账目");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
@@ -188,9 +206,11 @@ test("并发触发（onStartup + onInstalled + 迟到的 alarm 同时到）每�
 test("窗口外（09:30）只跑签到批，绝不触碰成长值接口", async () => {
     const h = await harness({ hour: 9, routes: ALL_OK });
     await h.run();
-    assert.equal(h.calls.length, 4, `期望 4 次请求，实际 ${h.calls.length}`);
+    assert.equal(h.calls.length, 5, `期望 5 次请求，实际 ${h.calls.length}`);
     assert.ok(h.calls.every((url) => !/reward\/getall/.test(url)), "窗口外不应调用 getall");
-    assert.ok(h.calls.every((url) => !/usertool\/|minidesk\//.test(url)), "窗口外不应触碰晚间批接口");
+    assert.ok(h.calls.every((url) => !/usertool\//.test(url)), "窗口外不应触碰晚间批接口");
+    assert.equal(h.calls.filter((url) => /vip-center-bff\/task\/sign/.test(url)).length, 1, "晨批照常打卡");
+    assert.equal(h.calls.filter((url) => /app\/user\/sign\/info/.test(url)).length, 1, "晨批只读一次核对昨日终态");
     assert.deepEqual(h.state.store.taskDoneOn, MORNING_DONE);
     assert.ok(!("vipGrowth" in h.state.store.taskDoneOn), "窗口外不应写入 vipGrowth 日期门");
 });
@@ -199,10 +219,10 @@ test("窗口内（21:30）跑完整晚批，并落下本地账目", async () => 
     const h = await harness({ hour: 21, routes: ALL_OK });
     await h.run();
     assert.equal(h.calls.filter((url) => /reward\/getall/.test(url)).length, 1, "getall 应恰好调用一次");
-    assert.equal(h.calls.filter((url) => /minidesk\/music\/sign\/pc/.test(url)).length, 1, "乐签复核应恰好调用一次");
+    assert.equal(h.calls.filter((url) => /app\/user\/sign\/info/.test(url)).length, 2, "晨批核昨日 + 晚批复核今日");
     assert.equal(h.calls.filter((url) => /task\/point\/receive/.test(url)).length, 1, "completed 的条目逐个领取");
     assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 1,
-        "复核说今日已签时不得补打，打卡请求全天只有晨批那一次");
+        "今日已有记录行时不得补打，打卡请求全天只有晨批那一次");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
     assert.equal(h.state.store.taskDoneOn.yunbeiTask, TODAY);
     assert.equal(h.state.store.taskDoneOn.vipGrowth, TODAY);
@@ -233,6 +253,7 @@ test("连签阶段奖励只领待领的那一档", async () => {
                 },
             },
             { re: /pointmall\/user\/sign\/lottery\/get\?/, body: { code: 200, data: true } },
+            SIGN_INFO_LANDED,
             OK_PUNCH,
             OK_CLAIM,
         ],
@@ -258,7 +279,7 @@ test("成长值已领但复核缺门时，晚批仍会运行并只补缺失的�
         store: { taskDoneOn: { ...MORNING_DONE, vipGrowth: TODAY } }
     });
     await h.run();
-    assert.equal(h.calls.filter((url) => /minidesk\/music\/sign\/pc/.test(url)).length, 1, "复核缺门应触发");
+    assert.equal(h.calls.filter((url) => /app\/user\/sign\/info/.test(url)).length, 1, "复核缺门应触发");
     assert.equal(h.calls.filter((url) => /usertool\/task\/todo\/query/.test(url)).length, 1, "云贝任务缺门应触发");
     assert.equal(h.calls.filter((url) => /reward\/getall/.test(url)).length, 0, "已领过的成长值不重复请求");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
@@ -296,33 +317,42 @@ test("瞬态失败不写日期门，下次触发会重试且不弹登录提醒",
     assert.equal(h.state.store.taskDoneOn.yunbeiSign, TODAY, "重试成功后才写日期门");
 });
 
-test("乐签复核：晚间发现凌晨打卡未生效时补打并回读确认", async () => {
-    let minideskReads = 0;
+test("乐签晨批终态：昨日有记录行时报已落签", async () => {
+    const h = await harness({ hour: 9, routes: ALL_OK });
+    await h.run();
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message === "乐签 2026-10-04 已落签"),
+        "晨批应先给昨天出终态");
+    assert.equal(h.state.store.taskDoneOn.vipSignFinal, TODAY);
+});
+
+test("乐签晨批终态：昨日缺记录行时报未落签，且不为过期的一天额外打卡", async () => {
+    const h = await harness({
+        hour: 9,
+        routes: [...ALL_OK.filter((route) => route !== SIGN_INFO_LANDED), {
+            re: /vipnewcenter\/app\/user\/sign\/info/,
+            body: { code: 200, data: [{ timeStr: "2026-10-04", recordId: 0, songId: 0, today: false }] }
+        }]
+    });
+    await h.run();
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("乐签 2026-10-04 未落签")));
+    assert.equal(h.calls.filter((url) => /vip-center-bff\/task\/sign/.test(url)).length, 1,
+        "昨天已无法补救，只能打今天这一次");
+});
+
+test("乐签复核：今日无记录行时补打一次，终态交给次日核对", async () => {
     const h = await harness({
         hour: 21,
-        routes: [
-            ...ALL_OK.filter((route) => route !== MINIDESK_SIGNED),
-            { re: /minidesk\/music\/sign\/pc/, body: () => (++minideskReads === 1 ? MINIDESK_NOT_SIGNED.body : MINIDESK_SIGNED.body) }
-        ]
+        routes: [...ALL_OK.filter((route) => route !== SIGN_INFO_LANDED), SIGN_INFO_EMPTY_TODAY]
     });
     await h.run();
 
     assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 2, "晨批试打 + 晚批补打各一次");
-    assert.equal(minideskReads, 2, "复核读一次 + 补打后回读一次");
-    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("已补打成功")),
-        "日志应记录补打结果");
-    assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
-});
-
-test("乐签复核：补打后仍未生效时如实记录且当天不再重试", async () => {
-    const h = await harness({
-        hour: 21,
-        routes: [...ALL_OK.filter((route) => route !== MINIDESK_SIGNED), MINIDESK_NOT_SIGNED]
-    });
-    await h.run();
-
-    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("补打后仍未生效")));
-    assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 2);
+    assert.equal(h.calls.filter((url) => /app\/user\/sign\/info/.test(url)).length, 2,
+        "补打后不得立刻回读 —— 记录行本来就要几小时才写出，回读只会得到假阴性");
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("已补打，终态次日核对")),
+        "日志不得把滞后的空窗写成「未生效」");
+    assert.ok(!h.state.store.runtimeLogs.some((entry) => entry.message.includes("未生效")),
+        "旧措辞「补打后仍未生效」是假阴性，不得再出现");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
 
     await h.run();

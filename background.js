@@ -144,6 +144,11 @@ function localDate(date) {
     return date.toDateString();
 }
 
+// 服务端 sign/info 用 ISO 形态的日期串当键（"2026-10-08"），与 localDate 的 toDateString 不通用。
+function isoDate(date) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
 // Icon Paths
 const ICONS_RED = {
     "16": "images/red16.png",
@@ -281,45 +286,58 @@ async function claimYunbeiTasks() {
     };
 }
 
-// 乐签打卡用 weapi 形态（interface3 + csrf）。这是唯一有落签实证的形态：
-// 10-05 12:07:30、10-06 00:08:07 两条乐签记录的 time 与它逐秒对应。
-// 客户端同款 eapi 形态只翻转任务态（task/list 变「已打卡」、今日成长值 +3），不生成乐签记录行，
-// 而且任务态一旦置为已打卡，当天再打只是空转 —— 2026-10-06 晚改道 eapi 因此是回归，已回退。
+// 乐签打卡用 weapi 形态（interface3 + csrf）。打卡请求本身是有效的：10-05 12:07:30、10-06 00:08:07、
+// 10-07 00:01:20、10-08 00:00:07 四条服务端记录行的 time 都逐秒等于当天的打卡时刻，
+// 其中前三天账号只在客户端被动收签到结果、没有做过任何手动打卡。
 async function requestVipSignPunch() {
     return weapiRequest(VIP_CENTER_HOST, "/weapi/vip-center-bff/task/sign", {}, await getCookie("__csrf"));
 }
 
-async function fetchVipSignCard() {
-    const card = await weapiRequest(VIP_CENTER_HOST, "/weapi/vipnewcenter/app/minidesk/music/sign/pc", { type: "0" }, await getCookie("__csrf"));
-    if (card.code !== 200) return { code: card.code };
-    // 已签判定看卡片条目的 sign；today 只是"今天的格子"标记，曾据此误报已签（2026-10-06）。
-    const list = card.data && Array.isArray(card.data.signInfoList) ? card.data.signInfoList : [];
-    const todayRow = list.find((row) => row && row.today === true);
-    return { signed: !!(todayRow && todayRow.sign === true) };
+// 落签的唯一权威依据：sign/info 里那一天的 recordId>0 且带 songId。
+// 不能用 minidesk 卡片的 sign —— 它和记录行一样滞后：10-08 00:00:07 已落签，21:00 卡片仍是未签，
+// 当时据此写出的「补打后仍未生效」是假阴性。today 字段更只是"今天的格子"标记，不代表已签。
+async function fetchVipSignRecord(day) {
+    const reply = await weapiRequest(VIP_CENTER_HOST, "/weapi/vipnewcenter/app/user/sign/info", {}, await getCookie("__csrf"));
+    if (reply.code !== 200) return { code: reply.code };
+
+    const rows = Array.isArray(reply.data) ? reply.data : [];
+    const row = rows.find((item) => item && item.timeStr === day);
+    return { landed: !!(row && row.recordId > 0 && row.songId > 0) };
 }
 
 async function signVipMusic() {
     const reply = await requestVipSignPunch();
     if (reply.code !== 200) return notLoggedIn(reply.code, "乐签") || rejected(reply.code, "乐签");
-    // data===true 只代表请求被受理，不代表已落签；终态由 21:00 的卡片复核给出。
+    // data===true 只代表请求被受理；记录行要几小时后才写出，终态由次日晨批核对。
     if (reply.data === true) return { done: true, message: "乐签：打卡请求已受理" };
 
     return { done: true, message: "乐签：本次未完成", details: { reason: reply.message || "" } };
 }
 
-async function verifyVipSign() {
-    const before = await fetchVipSignCard();
-    if (before.code !== undefined) return notLoggedIn(before.code, "乐签复核") || rejected(before.code, "乐签复核");
-    if (before.signed) return { done: true, message: "乐签复核：今日已签" };
+// 晨批第一件事是给昨天出终态：这一天已经过了，读不到记录行就是真丢了，补也补不了。
+async function finalizeVipSign() {
+    const prev = new Date();
+    prev.setDate(prev.getDate() - 1);
+    const day = isoDate(prev);
+    const record = await fetchVipSignRecord(day);
+    if (record.code !== undefined) return notLoggedIn(record.code, "乐签终态") || rejected(record.code, "乐签终态");
 
+    return record.landed
+        ? { done: true, message: `乐签 ${day} 已落签` }
+        : { done: true, message: `乐签 ${day} 未落签，已过当天无法补` };
+}
+
+async function verifyVipSign() {
+    const record = await fetchVipSignRecord(isoDate(new Date()));
+    if (record.code !== undefined) return notLoggedIn(record.code, "乐签复核") || rejected(record.code, "乐签复核");
+    if (record.landed) return { done: true, message: "乐签复核：今日已落签" };
+
+    // "今日无记录行"分不清真没落签还是仍在排队，而补打是当天唯一的修复机会：
+    // 真丢了它会补出记录行，只是在排队时空转无害。所以这里不打第二次读，终态交给次日晨批。
     const punch = await requestVipSignPunch();
     if (punch.code !== 200) return notLoggedIn(punch.code, "乐签补打") || rejected(punch.code, "乐签补打");
 
-    const after = await fetchVipSignCard();
-    // 补打只在看得到未签时才可能生效：服务端一旦把任务态置为已打卡，当天再打就是空转，
-    // 此时 punchAck=true 而卡片仍未签，说明当天已经救不回来了。
-    if (after.signed) return { done: true, message: "乐签复核：凌晨打卡未生效，已补打成功" };
-    return { done: true, message: "乐签复核：补打后仍未生效", details: { punchAck: punch.data === true } };
+    return { done: true, message: "乐签复核：今日暂无记录行，已补打，终态次日核对", details: { punchAck: punch.data === true } };
 }
 
 async function claimVipGrowth() {
@@ -371,6 +389,7 @@ const TASKS = [
     { key: "dailyTask", batch: "morning", run: signDailyTask },
     { key: "yunbeiSign", batch: "morning", run: signYunbei },
     { key: "yunbeiStage", batch: "morning", run: claimYunbeiStages },
+    { key: "vipSignFinal", batch: "morning", run: finalizeVipSign },
     { key: "vipSign", batch: "morning", run: signVipMusic },
     { key: "vipSignCheck", batch: "night", run: verifyVipSign },
     { key: "yunbeiTask", batch: "night", run: claimYunbeiTasks },
