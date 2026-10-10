@@ -15,7 +15,7 @@
 | 新增 | 说明 |
 |---|---|
 | 云贝中心签到 + 连续签到阶段奖励 | 除原有 `/api/point/dailyTask` 外，另走 `pointmall/user/sign` 完成云贝签到，并自动领取已达标（3 / 7 / 28 天）的阶段奖励 |
-| 黑胶乐签 | 打卡走 `vip-center-bff/task/sign` 的 weapi 加密请求，无会员权益也可签到；21:00 后若服务端当天还没有签到记录行则补打一次，终态由次日晨批核对前一天的 `sign/info` 记录行给出 |
+| 黑胶乐签 | 打卡走 `vip-center-bff/task/sign` 的 weapi 加密请求，无会员权益也可签到；是否计入以成长值流水（`level/growth/details`）里当天的「黑胶乐签每日打卡」条目为准，21:00 后若当天流水还没有该条目则补打一次，终态由次日晨批按同一条判据给出 |
 | 云贝任务奖励一键领取 | 走 `usertool/task/todo/query` + `usertool/task/point/receive`，在 21:00–23:59 与成长值同批领取已完成的任务奖励（如听漫游），只领已完成项、不代做任务 |
 | VIP 成长值一键领取 | 走 `vipnewcenter/app/level/task/reward/getall`，只在本地时间 21:00–23:59 触发、每天最多一次 |
 | weapi 加密层 | 上述接口只接受密文。`weapi.js` 用 WebCrypto（AES-128-CBC）+ BigInt 裸 RSA 自实现。**零第三方依赖**，不引入 crypto-js / node-forge |
@@ -24,14 +24,14 @@
 两点取舍需要说明：
 
 - **只产出 Chromium / Edge 构建**。Firefox 的构建分支已移除，addons.mozilla.org 上仍是上游旧版，不含上述功能。
-- **为什么晚间批定在 21:00 之后**。云贝任务奖励与成长值都要等白天攒进度，白天去领往往无值可领。乐签则是因为**服务端记录行有数小时的滞后**：打卡回执 `data:true` 是有效的，但 `sign/info` 里那一天的记录和日历卡片要几个小时后才显示出来（`time` 仍回填成打卡那一刻），所以当天无法判定终态 —— 21:00 只在「今天还没有记录行」时补打一次（真丢了它是唯一修复机会，只是在排队时空转无害），确切的结论由次日晨批核对前一天给出。所以这三批动作都只在 21:00–23:59 触发，每天各一次。错过当晚：成长值与云贝任务奖励会在下一个窗口一并领走；乐签属签到类，漏一晚即断签一天。
+- **为什么晚间批定在 21:00 之后**。云贝任务奖励与成长值都要等白天攒进度，白天去领往往无值可领。乐签的「是否计入」看成长值流水：晨批那次打卡即使回了 `data:true`，也可能没换成流水里的一条「黑胶乐签每日打卡」；21:00 若当天还没有这条条目就是真没计入，补打是当天唯一的修复机会（服务端按天去重 —— 10-09 打了两次，流水只记一条，所以补打不会重复加分）。注意 `sign/info` 里那天的**唱片记录行**是另一条更慢、且会整段不出的流水线，实测已证伪它作为判据（10-09 流水 00:00:04 已计 +3、当月累计天数也已含它，记录行到 +41h 仍为 0），扩展不再读它。所以这三批动作都只在 21:00–23:59 触发，每天各一次。错过当晚：成长值与云贝任务奖励会在下一个窗口一并领走；乐签属签到类，漏一晚即断签一天。
 
 许可证沿用上游的 GPL-3.0，二改代码同样以 GPL-3.0 开源。
 
 ## 主要功能
 
 - **每日签到**：自动完成网页端签到与云贝中心签到，并领取已达标的连续签到奖励（3 天 / 7 天 / 28 天）。
-- **黑胶乐签**：自动完成「黑胶乐签」打卡（`vip-center-bff/task/sign`），无会员权益也可签到；晚间 21:00 后若服务端当天还没有记录行则补打一次，终态由次日晨批核对前一天。
+- **黑胶乐签**：自动完成「黑胶乐签」打卡（`vip-center-bff/task/sign`），无会员权益也可签到；晚间 21:00 后若当天成长值流水还没有「黑胶乐签每日打卡」条目则补打一次，终态由次日晨批按同一条判据给出。
 - **云贝任务奖励一键领取**：每天 21:00–23:59 把已完成的云贝任务奖励（如听漫游）逐个领取，只领已完成项，不代做任务本身。
 - **VIP 成长值一键领取**：每天 21:00–23:59 之间领取已完成的成长任务奖励，每天只调用一次。成长值不过期，错过当晚会在下一个窗口一并领取。
 - **登录提醒**：如果用户尚未登录，将发送一条通知进行提醒，点击跳转至后台已打开的网页。
@@ -107,7 +107,7 @@ Still GPL-3.0, same as upstream; all changes in this fork are open under GPL-3.0
 ## Key Features
 
 - **Daily Check-in**: Completes both the web check-in and the YunBei (云贝) center check-in, and claims consecutive sign-in rewards once reached (3 / 7 / 28 days).
-- **Vinyl Music Sign (黑胶乐签)**: Completes the daily Music Sign punch through the same encrypted weapi call; works without a VIP entitlement. Because the record row appears on the server hours after the punch, the evening batch re-punches once only when today's row is still missing, and the following morning reports the final verdict for the day that just ended.
+- **Vinyl Music Sign (黑胶乐签)**: Completes the daily Music Sign punch through the same encrypted weapi call; works without a VIP entitlement. Whether a day actually counted is judged by that day's `黑胶乐签每日打卡` entry in the growth-point ledger (`level/growth/details`). The `sign/info` record row comes from a slower pipeline that can stay missing indefinitely — verified on 10-09, where the ledger entry and the monthly counter both existed 41 hours before any row appeared — so it is no longer used as the verdict. The evening batch re-punches once only when today's ledger entry is still missing, and the following morning reports the final verdict for the day that just ended.
 - **YunBei Task Rewards**: Claims completed YunBei task rewards (e.g. Listen-to-Roaming) one by one between 21:00–23:59. Only finished tasks are claimed — the extension never performs the tasks themselves.
 - **VIP Growth Points**: Claims finished growth-task rewards once a day between 21:00–23:59 local time. Points never expire — a missed evening is picked up in the next window.
 - **Login Reminder**: If user has not logged in yet, will show a notification. Will switch to the opened webpage when user click it.

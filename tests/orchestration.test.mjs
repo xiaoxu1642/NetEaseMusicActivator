@@ -1,5 +1,5 @@
 // 调度与门控的行为测试：在独立 vm 上下文里加载扩展真身，用 chrome/fetch 桩件离线跑
-// checkAndRun，验证「21:00 硬窗口、每天最多一次、瞬态失败不写门、乐签只在缺签时补打」这些约束真的生效。
+// checkAndRun，验证「21:00 硬窗口、每天最多一次、瞬态失败不写门、乐签只在成长值流水缺条目时补打」这些约束真的生效。
 // 上下文必须独立于宿主 realm：伪造 Date 泄漏到宿主会污染测试进程自身的序列化。
 // 跑法：node --test（在仓库根目录运行；带目录参数的 node --test tests/ 在 Node 25 下会报 MODULE_NOT_FOUND）
 import test from "node:test";
@@ -28,29 +28,52 @@ const OK_TODO = {
     }
 };
 const OK_RECEIVE = { re: /usertool\/task\/point\/receive/, body: { code: 200, data: true } };
-// 落签的唯一判据是 sign/info 里那一天的 recordId>0 且有 songId；minidesk 卡片会滞后数小时，已不再使用。
+// 乐签计入的唯一判据 = 成长值流水里当天那条「黑胶乐签每日打卡」。sign/info 的 recordId 属于另一条
+// 更慢、且会整段不出的唱片记录行流水线（10-09 流水已计 +3、recordId 到 +41h 仍为 0），不再读它。
 // 冻结的时钟是 2026-10-05，所以"今天"= 2026-10-05，晨批终态核对的"昨天"= 2026-10-04。
-const SIGN_INFO_LANDED = {
-    re: /vipnewcenter\/app\/user\/sign\/info/,
-    body: {
-        code: 200,
-        data: [
-            { timeStr: "2026-10-05", recordId: 733, songId: 42, score: 3, today: true },
-            { timeStr: "2026-10-04", recordId: 732, songId: 43, score: 3, today: false }
-        ]
-    }
-};
-const SIGN_INFO_EMPTY_TODAY = {
-    re: /vipnewcenter\/app\/user\/sign\/info/,
-    body: {
-        code: 200,
-        data: [
-            { timeStr: "2026-10-05", recordId: 0, songId: 0, score: 3, today: true },
-            { timeStr: "2026-10-04", recordId: 732, songId: 43, score: 3, today: false }
-        ]
-    }
-};
-const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, SIGN_INFO_LANDED, OK_PUNCH, OK_TODO, OK_RECEIVE, OK_CLAIM];
+// 日界必须按本地时区构造，与 background.js 的 dayBounds 同源（宿主与 vm 同一时区，显式传参不吃冻结时钟）。
+const DAY_START = new Date(2026, 9, 5).getTime();
+const PREV_DAY_START = new Date(2026, 9, 4).getTime();
+const PREV2_DAY_START = new Date(2026, 9, 3).getTime();
+const LEDGER_RE = /weapi\/vipnewcenter\/app\/level\/growth\/details\?/;
+const ledger = (details, hasMore = false) => ({
+    re: LEDGER_RE,
+    body: { code: 200, message: "success", data: { hasMore, details } }
+});
+// 今天与昨天都已计入，另掺一条"昨天 23:00 的 SVIP 发放"：它落在昨天的日界内但不是乐签，必须不算数。
+const LEDGER_COUNTED = ledger([
+    { descript: "黑胶乐签每日打卡", growthPoint: 3, time: DAY_START + 4900, resourceId: 0 },
+    { descript: "黑胶SVIP每日发放", growthPoint: 20, time: DAY_START - 3600000, resourceId: 168404218 },
+    { descript: "黑胶乐签每日打卡", growthPoint: 3, time: PREV_DAY_START + 4300, resourceId: 0 },
+    { descript: "每日听VIP歌曲 会员任务", growthPoint: 3, time: PREV2_DAY_START + 90000, resourceId: 5048000 }
+]);
+// 昨天被覆盖到（有更早的条目垫底）却没有乐签条目 → 真没计入。
+const LEDGER_MISS_YESTERDAY = ledger([
+    { descript: "黑胶乐签每日打卡", growthPoint: 3, time: DAY_START + 4900, resourceId: 0 },
+    { descript: "黑胶SVIP每日发放", growthPoint: 20, time: PREV_DAY_START + 500000, resourceId: 168404218 },
+    { descript: "黑胶SVIP每日发放", growthPoint: 20, time: PREV2_DAY_START + 500000, resourceId: 168404218 }
+]);
+// 全部条目都晚于"昨天"的日界 → 连日界都没翻到，只能说证据不足，不得写成未计入。
+const LEDGER_NOT_COVERED = ledger([
+    { descript: "黑胶乐签每日打卡", growthPoint: 3, time: DAY_START + 4900, resourceId: 0 },
+    { descript: "黑胶SVIP每日发放", growthPoint: 20, time: DAY_START + 3600000, resourceId: 168404218 }
+]);
+// 昨天有、今天没有：晚批必须补打一次。
+const LEDGER_NO_TODAY = ledger([
+    { descript: "黑胶乐签每日打卡", growthPoint: 3, time: PREV_DAY_START + 4300, resourceId: 0 },
+    { descript: "黑胶SVIP每日发放", growthPoint: 20, time: PREV2_DAY_START + 500000, resourceId: 168404218 }
+]);
+// 只有今天当天的非乐签条目：晨批核昨日、晚批核今日都覆盖不到 → 两处都只能"无法判定"，且都不补打。
+const LEDGER_ONLY_TODAY_NOISE = ledger([
+    { descript: "黑胶SVIP每日发放", growthPoint: 20, time: DAY_START + 3600000, resourceId: 168404218 },
+    { descript: "每日听VIP歌曲 会员任务", growthPoint: 3, time: DAY_START + 7200000, resourceId: 5048000 }
+]);
+// 翻页桩件：limit/offset 在 POST body 里，fetch 桩件只看得到 URL，所以按调用序号发页。
+function ledgerPages(bodies) {
+    let n = 0;
+    return { re: LEDGER_RE, body: () => bodies[Math.min(n++, bodies.length - 1)] };
+}
+const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, LEDGER_COUNTED, OK_PUNCH, OK_TODO, OK_RECEIVE, OK_CLAIM];
 
 const TODAY = "Mon Oct 05 2026";
 const MORNING_DONE = { dailyTask: TODAY, yunbeiSign: TODAY, yunbeiStage: TODAY, vipSignFinal: TODAY, vipSign: TODAY };
@@ -182,13 +205,13 @@ test("并发触发（onStartup + onInstalled + 迟到的 alarm 同时到）每�
     const h = await harness({ hour: 21, routes: ALL_OK });
     await h.runConcurrently(3);
 
-    // sign/info 是只读核对，晨批核昨日 + 晚批核今日各读一次；其余（含打卡）全天各一次。
+    // 成长值流水是只读核对，晨批核昨日 + 晚批核今日各读一次；其余（含打卡）全天各一次。
     const expectedHits = {
         "/api/point/dailyTask": 1,
         "/weapi/pointmall/user/sign?": 1,
         "/weapi/pointmall/user/sign/config?": 1,
         "/weapi/vip-center-bff/task/sign": 1,
-        "/weapi/vipnewcenter/app/user/sign/info": 2,
+        "/weapi/vipnewcenter/app/level/growth/details?": 2,
         "/weapi/usertool/task/todo/query": 1,
         "/weapi/usertool/task/point/receive": 1,
         "/weapi/vipnewcenter/app/level/task/reward/getall": 1
@@ -206,11 +229,13 @@ test("并发触发（onStartup + onInstalled + 迟到的 alarm 同时到）每�
 test("窗口外（09:30）只跑签到批，绝不触碰成长值接口", async () => {
     const h = await harness({ hour: 9, routes: ALL_OK });
     await h.run();
+    const GROWTH_READ = (url) => /weapi\/vipnewcenter\/app\/level\/growth\/details/.test(url);
+
     assert.equal(h.calls.length, 5, `期望 5 次请求，实际 ${h.calls.length}`);
     assert.ok(h.calls.every((url) => !/reward\/getall/.test(url)), "窗口外不应调用 getall");
     assert.ok(h.calls.every((url) => !/usertool\//.test(url)), "窗口外不应触碰晚间批接口");
     assert.equal(h.calls.filter((url) => /vip-center-bff\/task\/sign/.test(url)).length, 1, "晨批照常打卡");
-    assert.equal(h.calls.filter((url) => /app\/user\/sign\/info/.test(url)).length, 1, "晨批只读一次核对昨日终态");
+    assert.equal(h.calls.filter(GROWTH_READ).length, 1, "晨批只读一次流水核对昨日终态");
     assert.deepEqual(h.state.store.taskDoneOn, MORNING_DONE);
     assert.ok(!("vipGrowth" in h.state.store.taskDoneOn), "窗口外不应写入 vipGrowth 日期门");
 });
@@ -219,10 +244,10 @@ test("窗口内（21:30）跑完整晚批，并落下本地账目", async () => 
     const h = await harness({ hour: 21, routes: ALL_OK });
     await h.run();
     assert.equal(h.calls.filter((url) => /reward\/getall/.test(url)).length, 1, "getall 应恰好调用一次");
-    assert.equal(h.calls.filter((url) => /app\/user\/sign\/info/.test(url)).length, 2, "晨批核昨日 + 晚批复核今日");
+    assert.equal(h.calls.filter((url) => /app\/level\/growth\/details/.test(url)).length, 2, "晨批核昨日 + 晚批复核今日");
     assert.equal(h.calls.filter((url) => /task\/point\/receive/.test(url)).length, 1, "completed 的条目逐个领取");
     assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 1,
-        "今日已有记录行时不得补打，打卡请求全天只有晨批那一次");
+        "今日流水已有乐签条目时不得补打，打卡请求全天只有晨批那一次");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
     assert.equal(h.state.store.taskDoneOn.yunbeiTask, TODAY);
     assert.equal(h.state.store.taskDoneOn.vipGrowth, TODAY);
@@ -253,7 +278,7 @@ test("连签阶段奖励只领待领的那一档", async () => {
                 },
             },
             { re: /pointmall\/user\/sign\/lottery\/get\?/, body: { code: 200, data: true } },
-            SIGN_INFO_LANDED,
+            LEDGER_COUNTED,
             OK_PUNCH,
             OK_CLAIM,
         ],
@@ -279,7 +304,7 @@ test("成长值已领但复核缺门时，晚批仍会运行并只补缺失的�
         store: { taskDoneOn: { ...MORNING_DONE, vipGrowth: TODAY } }
     });
     await h.run();
-    assert.equal(h.calls.filter((url) => /app\/user\/sign\/info/.test(url)).length, 1, "复核缺门应触发");
+    assert.equal(h.calls.filter((url) => /app\/level\/growth\/details/.test(url)).length, 1, "复核缺门应触发");
     assert.equal(h.calls.filter((url) => /usertool\/task\/todo\/query/.test(url)).length, 1, "云贝任务缺门应触发");
     assert.equal(h.calls.filter((url) => /reward\/getall/.test(url)).length, 0, "已领过的成长值不重复请求");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
@@ -317,46 +342,114 @@ test("瞬态失败不写日期门，下次触发会重试且不弹登录提醒",
     assert.equal(h.state.store.taskDoneOn.yunbeiSign, TODAY, "重试成功后才写日期门");
 });
 
-test("乐签晨批终态：昨日有记录行时报已落签", async () => {
+test("乐签晨批终态：昨日流水有条目时报已计入，且不再请求 sign/info", async () => {
     const h = await harness({ hour: 9, routes: ALL_OK });
     await h.run();
-    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message === "乐签 2026-10-04 已落签"),
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message === "乐签 2026-10-04 已计入"),
         "晨批应先给昨天出终态");
     assert.equal(h.state.store.taskDoneOn.vipSignFinal, TODAY);
+    assert.equal(h.calls.filter((url) => /app\/user\/sign\/info/.test(url)).length, 0,
+        "唱片记录行会整段不出（10-09 即如此），读它会再造假阴性，判据不得回到 sign/info");
 });
 
-test("乐签晨批终态：昨日缺记录行时报未落签，且不为过期的一天额外打卡", async () => {
+test("乐签晨批终态：流水覆盖到昨日却无乐签条目时报未计入，且不为过期的一天额外打卡", async () => {
     const h = await harness({
         hour: 9,
-        routes: [...ALL_OK.filter((route) => route !== SIGN_INFO_LANDED), {
-            re: /vipnewcenter\/app\/user\/sign\/info/,
-            body: { code: 200, data: [{ timeStr: "2026-10-04", recordId: 0, songId: 0, today: false }] }
-        }]
+        routes: [...ALL_OK.filter((route) => route !== LEDGER_COUNTED), LEDGER_MISS_YESTERDAY]
     });
     await h.run();
-    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("乐签 2026-10-04 未落签")));
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("乐签 2026-10-04 未计入")));
     assert.equal(h.calls.filter((url) => /vip-center-bff\/task\/sign/.test(url)).length, 1,
         "昨天已无法补救，只能打今天这一次");
 });
 
-test("乐签复核：今日无记录行时补打一次，终态交给次日核对", async () => {
+test("乐签晨批终态：流水没覆盖到昨日时只能声明无法判定，不得写成未计入", async () => {
+    const h = await harness({
+        hour: 9,
+        routes: [...ALL_OK.filter((route) => route !== LEDGER_COUNTED), LEDGER_NOT_COVERED]
+    });
+    await h.run();
+    const messages = h.state.store.runtimeLogs.map((entry) => entry.message);
+    assert.ok(messages.some((message) => message.includes("乐签 2026-10-04 无法判定：流水未覆盖当天")));
+    assert.ok(!messages.some((message) => message.includes("未计入")), "证据不足不得降级成失败断言");
+});
+
+test("乐签流水条目按日界取：昨天的日界内必须有非乐签条目也不算计入", async () => {
+    const h = await harness({
+        hour: 9,
+        routes: [...ALL_OK.filter((route) => route !== LEDGER_COUNTED), ledger([
+            { descript: "黑胶乐签每日打卡", growthPoint: 3, time: DAY_START + 4900, resourceId: 0 },
+            { descript: "黑胶SVIP每日发放", growthPoint: 20, time: PREV_DAY_START + 4300, resourceId: 168404218 },
+            { descript: "每日听VIP歌曲 会员任务", growthPoint: 3, time: PREV2_DAY_START + 90000, resourceId: 5048000 }
+        ])]
+    });
+    await h.run();
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("乐签 2026-10-04 未计入")),
+        "同一天里 descript 不含「乐签」的 +3 条目不是打卡流水");
+});
+
+test("乐签复核：今日流水已有条目时零补打，重复触发也不补", async () => {
+    const h = await harness({ hour: 21, routes: ALL_OK });
+    await h.run();
+    await h.run();
+    const punches = h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url));
+    assert.equal(punches.length, 1, "已计入的日子不得再打一次（10-09 空打的回归锁）");
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message === "乐签复核：今日已计入"));
+});
+
+test("乐签复核：今日流水无条目且已覆盖时补打一次，终态交给次日核对", async () => {
     const h = await harness({
         hour: 21,
-        routes: [...ALL_OK.filter((route) => route !== SIGN_INFO_LANDED), SIGN_INFO_EMPTY_TODAY]
+        routes: [...ALL_OK.filter((route) => route !== LEDGER_COUNTED), LEDGER_NO_TODAY]
     });
     await h.run();
 
     assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 2, "晨批试打 + 晚批补打各一次");
-    assert.equal(h.calls.filter((url) => /app\/user\/sign\/info/.test(url)).length, 2,
-        "补打后不得立刻回读 —— 记录行本来就要几小时才写出，回读只会得到假阴性");
-    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("已补打，终态次日核对")),
-        "日志不得把滞后的空窗写成「未生效」");
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message.includes("今日流水无乐签条目，已补打，终态次日核对")));
     assert.ok(!h.state.store.runtimeLogs.some((entry) => entry.message.includes("未生效")),
         "旧措辞「补打后仍未生效」是假阴性，不得再出现");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
 
     await h.run();
     assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 2, "当天不得重复补打");
+});
+
+test("乐签复核：流水覆盖不到今天就声明无法判定并跳过补打", async () => {
+    const h = await harness({
+        hour: 21,
+        routes: [...ALL_OK.filter((route) => route !== LEDGER_COUNTED), LEDGER_ONLY_TODAY_NOISE]
+    });
+    await h.run();
+    const messages = h.state.store.runtimeLogs.map((entry) => entry.message);
+    assert.ok(messages.some((message) => message.includes("乐签 2026-10-04 无法判定")));
+    assert.ok(messages.some((message) => message === "乐签复核：流水未覆盖当天，暂不补打"),
+        "补打是写操作，不能建立在没读到的流水上");
+    assert.equal(h.calls.filter((url) => /weapi\/vip-center-bff\/task\/sign/.test(url)).length, 1);
+});
+
+test("乐签流水翻页：目标条目在第 2 页时仍判已计入，且确实读满两页", async () => {
+    const h = await harness({
+        hour: 9,
+        routes: [...ALL_OK.filter((route) => route !== LEDGER_COUNTED), ledgerPages([
+            ledger([{ descript: "黑胶SVIP每日发放", growthPoint: 20, time: DAY_START - 60000, resourceId: 168404218 }], true).body,
+            ledger([{ descript: "黑胶乐签每日打卡", growthPoint: 3, time: PREV_DAY_START + 4300, resourceId: 0 }]).body
+        ])]
+    });
+    await h.run();
+    assert.ok(h.state.store.runtimeLogs.some((entry) => entry.message === "乐签 2026-10-04 已计入"));
+    assert.equal(h.calls.filter((url) => /app\/level\/growth\/details/.test(url)).length, 2,
+        "第 1 页 hasMore=true 时必须续读第 2 页");
+});
+
+test("乐签流水返回 301 时中止整批并提醒登录，不写终态日期门", async () => {
+    const h = await harness({
+        hour: 9,
+        routes: [...ALL_OK.filter((route) => route !== LEDGER_COUNTED), { re: LEDGER_RE, body: { code: 301 } }]
+    });
+    await h.run();
+    assert.deepEqual(h.state.notifications, ["netease_login_needed"]);
+    assert.ok(!("vipSignFinal" in h.state.store.taskDoneOn), "未登录不得写入乐签终态日期门");
+    assert.ok(!("vipSign" in h.state.store.taskDoneOn), "中止之后的打卡同样不得写门");
 });
 
 test("云贝任务：只领 completed 的条目，未完成的不触碰领取接口", async () => {

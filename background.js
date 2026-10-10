@@ -14,11 +14,15 @@ const MUSIC_HOST = "music.163.com";
 const INTERFACE_HOST = "interface.music.163.com";
 const VIP_CENTER_HOST = "interface3.music.163.com";
 
-// 乐签打卡可能被服务端静默丢弃（曾出现接口成功但未落签）；云贝任务奖励与成长值要等白天攒进度，所以这些动作固定在本地时间 21:00 之后。
+// 云贝任务奖励与成长值要等白天攒进度，乐签复核也要给服务端留出写流水的时间，所以这些动作固定在本地时间 21:00 之后。
 const VIP_CLAIM_HOUR = 21;
 const TASK_STATE_KEY = "taskDoneOn";
 const VIP_GROWTH_LOG_KEY = "vipGrowthLog";
 const VIP_GROWTH_LOG_MAX = 60;
+
+// 成长值流水是「乐签有没有被计入」的唯一依据，取数固定翻满这几页再判定（理由见 hasMusicSignLedgerEntry）。
+const LEDGER_PAGE_SIZE = 40;
+const LEDGER_PAGES = 2;
 
 let logWriteQueue = Promise.resolve();
 
@@ -293,51 +297,77 @@ async function requestVipSignPunch() {
     return weapiRequest(VIP_CENTER_HOST, "/weapi/vip-center-bff/task/sign", {}, await getCookie("__csrf"));
 }
 
-// 落签的唯一权威依据：sign/info 里那一天的 recordId>0 且带 songId。
-// 不能用 minidesk 卡片的 sign —— 它和记录行一样滞后：10-08 00:00:07 已落签，21:00 卡片仍是未签，
-// 当时据此写出的「补打后仍未生效」是假阴性。today 字段更只是"今天的格子"标记，不代表已签。
-async function fetchVipSignRecord(day) {
-    const reply = await weapiRequest(VIP_CENTER_HOST, "/weapi/vipnewcenter/app/user/sign/info", {}, await getCookie("__csrf"));
-    if (reply.code !== 200) return { code: reply.code };
+// "2026-10-09" → 本地日界 [当天 00:00:00.000, 次日 00:00:00.000)。
+// new Date("2026-10-09") 这种只有"日"粒度的串会按 UTC 解析，isoDate 的输出正好踩这条，所以拆数字构造。
+function dayBounds(day) {
+    const [year, month, date] = day.split("-").map(Number);
+    return [new Date(year, month - 1, date).getTime(), new Date(year, month - 1, date + 1).getTime()];
+}
 
-    const rows = Array.isArray(reply.data) ? reply.data : [];
-    const row = rows.find((item) => item && item.timeStr === day);
-    return { landed: !!(row && row.recordId > 0 && row.songId > 0) };
+// 乐签计入的唯一依据：成长值流水里那一天有一条「黑胶乐签每日打卡」的 +3 条目。
+// 不再用 sign/info 的 recordId —— 它属于另一条更慢、且会整段不出的唱片记录行流水线：
+// 10-09 流水 00:00:04 已计 +3、monthCheckInTotalDay 也已含它，sign/info 到 +41h 却仍无行，
+// 而当天已打过两次（00:00 与 21:00），流水只记一条 ⇒ 服务端按天去重，多打无益。
+// counted 是三态：true 已计入 / false 已覆盖到那天但无条目 / null 连日界都没翻到（证据不足，不得当成失败）。
+async function hasMusicSignLedgerEntry(day) {
+    const [from, to] = dayBounds(day);
+    const csrfToken = await getCookie("__csrf");
+    const scanned = [];
+    // 不早停：早停要假设流水按时间倒序，那只是实测观察、不是协议保证，乱序时会在覆盖目标日之前退出并误判。
+    for (let page = 0; page < LEDGER_PAGES; page++) {
+        const reply = await weapiRequest(VIP_CENTER_HOST, "/weapi/vipnewcenter/app/level/growth/details",
+            { limit: String(LEDGER_PAGE_SIZE), offset: String(page * LEDGER_PAGE_SIZE) }, csrfToken);
+        if (reply.code !== 200) return { code: reply.code };
+
+        const details = reply.data && Array.isArray(reply.data.details) ? reply.data.details : [];
+        scanned.push(...details);
+        if (!reply.data || reply.data.hasMore !== true) break;
+    }
+
+    if (scanned.some((item) => item && item.time >= from && item.time < to && String(item.descript || "").includes("乐签"))) {
+        return { counted: true };
+    }
+
+    return { counted: scanned.some((item) => item && typeof item.time === "number" && item.time < from) ? false : null };
 }
 
 async function signVipMusic() {
     const reply = await requestVipSignPunch();
     if (reply.code !== 200) return notLoggedIn(reply.code, "乐签") || rejected(reply.code, "乐签");
-    // data===true 只代表请求被受理；记录行要几小时后才写出，终态由次日晨批核对。
+    // data===true 只代表请求被受理；是否计入要看成长值流水，终态由次日晨批核对。
     if (reply.data === true) return { done: true, message: "乐签：打卡请求已受理" };
 
     return { done: true, message: "乐签：本次未完成", details: { reason: reply.message || "" } };
 }
 
-// 晨批第一件事是给昨天出终态：这一天已经过了，读不到记录行就是真丢了，补也补不了。
+// 晨批第一件事是给昨天出终态：这一天已经过了，流水里没有条目就是真没计入，补也补不了。
 async function finalizeVipSign() {
     const prev = new Date();
     prev.setDate(prev.getDate() - 1);
     const day = isoDate(prev);
-    const record = await fetchVipSignRecord(day);
-    if (record.code !== undefined) return notLoggedIn(record.code, "乐签终态") || rejected(record.code, "乐签终态");
+    const ledger = await hasMusicSignLedgerEntry(day);
+    if (ledger.code !== undefined) return notLoggedIn(ledger.code, "乐签终态") || rejected(ledger.code, "乐签终态");
+    // 措辞的强度跟着判据走：覆盖不到那天只能声明证据不足，不写"未计入"。
+    if (ledger.counted === null) return { done: true, message: `乐签 ${day} 无法判定：流水未覆盖当天`, details: { pages: LEDGER_PAGES } };
 
-    return record.landed
-        ? { done: true, message: `乐签 ${day} 已落签` }
-        : { done: true, message: `乐签 ${day} 未落签，已过当天无法补` };
+    return ledger.counted
+        ? { done: true, message: `乐签 ${day} 已计入` }
+        : { done: true, message: `乐签 ${day} 未计入，已过当天无法补` };
 }
 
 async function verifyVipSign() {
-    const record = await fetchVipSignRecord(isoDate(new Date()));
-    if (record.code !== undefined) return notLoggedIn(record.code, "乐签复核") || rejected(record.code, "乐签复核");
-    if (record.landed) return { done: true, message: "乐签复核：今日已落签" };
+    const ledger = await hasMusicSignLedgerEntry(isoDate(new Date()));
+    if (ledger.code !== undefined) return notLoggedIn(ledger.code, "乐签复核") || rejected(ledger.code, "乐签复核");
+    if (ledger.counted === true) return { done: true, message: "乐签复核：今日已计入" };
+    // 读不到流水就不动作：补打是写操作，不能建立在证据不足上。
+    if (ledger.counted === null) return { done: true, message: "乐签复核：流水未覆盖当天，暂不补打", details: { pages: LEDGER_PAGES } };
 
-    // "今日无记录行"分不清真没落签还是仍在排队，而补打是当天唯一的修复机会：
-    // 真丢了它会补出记录行，只是在排队时空转无害。所以这里不打第二次读，终态交给次日晨批。
+    // 走到这里才是真缺口：晨批那次 data===true 的受理没换成计入。补打是当天唯一的修复机会，
+    // 服务端按天去重（10-09 打两次只记一条），所以这次补打不会重复加分。
     const punch = await requestVipSignPunch();
     if (punch.code !== 200) return notLoggedIn(punch.code, "乐签补打") || rejected(punch.code, "乐签补打");
 
-    return { done: true, message: "乐签复核：今日暂无记录行，已补打，终态次日核对", details: { punchAck: punch.data === true } };
+    return { done: true, message: "乐签复核：今日流水无乐签条目，已补打，终态次日核对", details: { punchAck: punch.data === true } };
 }
 
 async function claimVipGrowth() {

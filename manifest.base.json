@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NetEaseMusicActivator",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "NetEase Cloud Music automatic check-in assistant.",
   "icons": {
     "16": "images/red16.png",
