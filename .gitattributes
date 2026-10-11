@@ -1,0 +1,7 @@
+# 没有这个文件时，core.autocrlf=true 会让同一次 checkout 在不同机器上产出不同字节：
+# 实测克隆出来的 background.js 是 23982 B（CRLF），仓库 blob 是 23375 B（LF），
+# 于是同一个 tag 在两台机器上打出的 zip 不同、任何按哈希做的产物对账都会假红。
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.zip binary

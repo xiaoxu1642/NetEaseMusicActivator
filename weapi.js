@@ -27,7 +27,8 @@ async function aesCbcEncryptToBase64(keyBytes, plaintext) {
     return bytesToBase64(cipher);
 }
 
-// 256 不整除 62，直接取模会让前 62 个字符概率偏高，所以丢弃 >= 248 的字节。
+// 256 不整除 62（256 % 62 = 8），直接取模会让 BASE62 的前 8 个字符（a–h）各多一次命中机会，
+// 所以丢弃 >= 248 的字节：248 = 62 × 4，剩下的字节里每个字符恰好被 4 个取值命中，完全均匀。
 function randomSecretKey() {
     const chars = [];
     const pool = new Uint8Array(64);
@@ -66,10 +67,12 @@ async function weapiEncrypt(payload, fixedSecretKey) {
     return { params, encSecKey: rsaNoPad([...secretKey].reverse().join("")) };
 }
 
-async function weapiRequest(host, path, data, csrfToken, query) {
-    const { params, encSecKey } = await weapiEncrypt({ ...data, csrf_token: csrfToken });
+async function weapiRequest(host, path, data, csrfToken) {
+    // 密文与 query 两侧的 csrf_token 必须同形：都缺就给空串，不能让密文丢掉这个键。
+    const { params, encSecKey } = await weapiEncrypt({ ...data, csrf_token: csrfToken || "" });
     const url = new URL(`https://${host}${path}`);
-    for (const [key, value] of Object.entries(query || {})) url.searchParams.set(key, value);
+    // csrf_token 同时出现在请求行（query）和密文里 —— 这是 weapi 协议的要求，不是重复提交。
+    // 副作用是它会被写进 HTTP 请求行；异常文本只带 path，凭据不会从错误消息里外流。
     url.searchParams.set("csrf_token", csrfToken || "");
 
     const response = await fetch(url.toString(), {
@@ -83,6 +86,9 @@ async function weapiRequest(host, path, data, csrfToken, query) {
     const json = await response.json().catch(() => {
         throw new Error(`响应不是 JSON ${path}`);
     });
+    // weapi 的信封一定带数字 code。缺它说明响应形态不是我们认的那种，调用方的 `code !== 200`
+    // 哨兵会当场失效（undefined !== 200 为真却走不进任何分支），「没读到结论」就被当成「结论是否定的」。
+    if (typeof json.code !== "number") throw new Error(`响应缺少 code 字段 ${path}`);
     return json;
 }
 
