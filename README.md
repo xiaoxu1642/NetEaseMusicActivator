@@ -24,16 +24,16 @@
 两点取舍需要说明：
 
 - **只产出 Chromium / Edge 构建**。Firefox 的构建分支已移除，addons.mozilla.org 上仍是上游旧版，不含上述功能。
-- **为什么晚间批定在 21:00 之后**。云贝任务奖励与成长值都要等白天攒进度，白天去领往往无值可领。乐签的「是否计入」看成长值流水：晨批那次打卡即使回了 `data:true`，也可能没换成流水里的一条 `黑胶乐签每日打卡`；21:00 若当天还没有这条条目就是真没计入，补打是当天唯一的修复机会（实测 10-09 打了两次，流水只记一条，据此认为服务端按天去重、补打不会重复加分 —— 这是**观察，不是协议保证**）。判据是三态而不是两态：流水翻到尽头（`hasMore` 不为 true）或条目时间跨度越过那一天，才允许写「未计入」；两者都拿不到就写「无法判定」，既不宣布失败也不发补打。注意 `sign/info` 里那天的**唱片记录行**是另一条更慢、且会整段不出的流水线，实测已证伪它作为判据（10-09 流水 00:00:04 已计 +3、当月累计天数也已含它，记录行到 +41h 仍为 0），扩展不再读它。所以这三批动作都只在 21:00–23:59 触发，每天各一次；晚批还有没落门的任务时（瞬态失败或接口拒绝），当晚每 20 分钟再排一次，把窗口内的修复机会用完，全部落门才顺延次日。错过当晚：成长值与云贝任务奖励会在下一个窗口一并领走；乐签属签到类，漏一晚即断签一天。
+- **为什么晚间批定在 21:00 之后**。云贝任务奖励与成长值都要等白天攒进度，白天去领往往无值可领。乐签的「是否计入」看成长值流水：晨批那次打卡即使回了 `data:true`，也可能没换成流水里的一条 `黑胶乐签每日打卡`；21:00 若当天还没有这条条目就是真没计入，补打是当天唯一的修复机会（实测 10-09 打了两次，流水只记一条，据此认为服务端按天去重、补打不会重复加分 —— 这是**观察，不是协议保证**）。判据是三态而不是两态：流水翻到尽头（`hasMore` 不为 true）或条目时间跨度越过那一天，才允许写「未计入」；两者都拿不到就写「无法判定」，既不宣布失败也不发补打。注意 `sign/info` 里那天的**唱片记录行**是另一条更慢、且会整段不出的流水线，实测已证伪它作为判据（10-09 流水 00:00:04 已计 +3、当月累计天数也已含它，记录行到 +41h 仍为 0），扩展不再读它。所以这三项的**首次**触发都在 21:00–23:59，每天各一次；晚批还有没落门的任务时（瞬态失败或接口拒绝），当晚每 20 分钟再排一次，把窗口内的修复机会用完，全部落门才顺延次日。错过当晚（浏览器那段时间没开）不再等于干等 24 小时：晚批的日期门按「哪一个晚上」归属（21:00 之前算刚过完的那个晚上），次日任何一次唤醒都会把**两个领取类任务**补跑掉，而补跑写的门落回那个晚上，不会把当晚的正常批挤掉。**乐签复核/补打不参与补跑**——过了午夜那一天就补不了了，它仍然只在当天窗口内运行，漏一晚即断签一天。
 
 许可证沿用上游的 GPL-3.0，二改代码同样以 GPL-3.0 开源。
 
 ## 主要功能
 
-- **每日签到**：自动完成网页端签到与云贝中心签到，并领取已达标的连续签到奖励（3 天 / 7 天 / 28 天）。
+- **每日签到**：自动完成网页端签到与云贝中心签到，并领取已达标的连续签到奖励（3 天 / 7 天 / 28 天）。判据只认两种正面证据：本次请求拿到 `code:200`，或云贝明确回 `sign:false`（文档化的「重复签到」）。`/api/point/dailyTask` 的 `-2` **不再被当成「今日已签」**——这个端点在两个参考协议实现里都没有文档，语义无从核对，所以按接口拒绝处理：不落当天日期门、把服务端的 `message` 原样写进日志、下次触发再试。同理，读不到 `sign` 字段（`data` 缺失、响应形态不对）也不是「已签」，是「本轮没有结论」。另外，`__csrf` 读不到时**一个写请求都不发**：缺 token 的答复曾被读成「今日已签」并落门，结果是当天两个签到其实都没打成，而扩展一整天不再重试。
 - **黑胶乐签**：自动完成「黑胶乐签」打卡（`vip-center-bff/task/sign`），无会员权益也可签到；晚间 21:00 后若当天成长值流水还没有 `黑胶乐签每日打卡`(+3) 条目则补打一次，终态由次日晨批按同一条判据给出。流水证据不足时报「无法判定」并保持当天可重试，本机没参与过的那一天报「未参与打卡」，都不会被写成漏签事故。
-- **云贝任务奖励一键领取**：每天 21:00–23:59 把已完成的云贝任务奖励（如听漫游）逐个领取，只领已完成项，不代做任务本身。
-- **VIP 成长值一键领取**：每天 21:00–23:59 之间领取已完成的成长任务奖励，每天只调用一次。成长值不过期，错过当晚会在下一个窗口一并领取。
+- **云贝任务奖励一键领取**：每天 21:00–23:59 把已完成的云贝任务奖励（如听漫游）逐个领取，只领已完成项，不代做任务本身；错过当晚会在次日首次唤醒时补领。
+- **VIP 成长值一键领取**：每天 21:00–23:59 之间领取已完成的成长任务奖励，每天只调用一次。成长值不过期，错过当晚会在次日首次唤醒时补领。
 - **登录提醒**：如果用户尚未登录，将发送一条通知进行提醒，点击跳转至后台已打开的网页。
 - **定时执行**：如果浏览器未打开或处于休眠状态，将在下一次打开时执行；当天窗口内若还有任务没拿到结论，会每 20 分钟再排一次。
 - **后台运行**：签到过程在后台静默完成，完成后自动关闭网页。
@@ -56,7 +56,7 @@ Firefox用户请点击下方链接跳转至Firefox Add-ons Store, 点击右侧�
 
 1. **登录账号**：先在 [网易云音乐官网 (music.163.com)](https://music.163.com/) 中**登录**您的账号。
 2. **自动运行**：扩展程序会自动读取您的登录状态（Cookies），并在后台自动进行每日的签到任务。
-3. **晚间批时间**：乐签复核补打、云贝任务奖励领取、成长值领取都在 21:00–23:59 之间进行（云贝签到与乐签的首次打卡仍在每天首次运行扩展时完成）；这段时间内浏览器需要处于打开状态。只要还有任务没拿到结论，扩展会在窗口内每 20 分钟再排一次，全部落门才顺延次日。成长值与云贝任务奖励错过当晚可在下一次窗口补领，乐签漏签一晚无法补。
+3. **晚间批时间**：乐签复核补打、云贝任务奖励领取、成长值领取都在 21:00–23:59 之间进行（云贝签到与乐签的首次打卡仍在每天首次运行扩展时完成）；这段时间内浏览器需要处于打开状态。只要还有任务没拿到结论，扩展会在窗口内每 20 分钟再排一次，全部落门才顺延次日。错过当晚时，**成长值与云贝任务奖励会在次日扩展第一次醒来时补领**（不需要等到下一个 21:00）；乐签复核不参与补跑，漏签一晚无法补。
 4. **状态切换**：不需要时点击logo即可停用，logo将自动切换为灰色。
 
 ## 隐私说明
@@ -110,16 +110,16 @@ This repository is a fork of [cmxin24/NetEaseMusicActivator](https://github.com/
 Two deliberate trade-offs:
 
 - **Chromium / Edge builds only.** The Firefox build branch was removed; the listing on addons.mozilla.org is still the upstream release and does not contain these features.
-- **Why the evening batch runs after 21:00.** YunBei task rewards and growth points need daytime progress, and the Music Sign punch can be silently dropped by the server (a success ack without an actual sign-in) — an evening re-check is what catches that. The verdict has three states, not two: "not counted" is only written when the ledger was actually exhausted (`hasMore` not true) or its entry timestamps bracket the target day; otherwise it says "cannot determine", which neither declares a failure nor fires the re-punch write. Note that the `sign/info` **record row** for a day comes from a separate, slower pipeline that can stay missing entirely — disproved as a verdict on 10-09 (the ledger entry and the monthly counter were both there 41 hours before any row appeared), so it is no longer read. These three actions therefore run only between 21:00–23:59, once a day; while any task still lacks a verdict the alarm is re-armed every 20 minutes inside that window, and only a fully settled batch rolls over to the next day. Missing one evening: growth points and YunBei rewards are picked up in the next window; a missed Music Sign evening is a lost streak day.
+- **Why the evening batch runs after 21:00.** YunBei task rewards and growth points need daytime progress, and the Music Sign punch can be silently dropped by the server (a success ack without an actual sign-in) — an evening re-check is what catches that. The verdict has three states, not two: "not counted" is only written when the ledger was actually exhausted (`hasMore` not true) or its entry timestamps bracket the target day; otherwise it says "cannot determine", which neither declares a failure nor fires the re-punch write. Note that the `sign/info` **record row** for a day comes from a separate, slower pipeline that can stay missing entirely — disproved as a verdict on 10-09 (the ledger entry and the monthly counter were both there 41 hours before any row appeared), so it is no longer read. These three actions therefore run only between 21:00–23:59, once a day; while any task still lacks a verdict the alarm is re-armed every 20 minutes inside that window, and only a fully settled batch rolls over to the next day. Missing one evening no longer means waiting 24 hours: the evening batch is attributed to *which evening* it belongs to (before 21:00 that means the one that just ended), so the two claim tasks run on the next wake-up instead, and the gate they write lands back on that evening — it cannot crowd out the normal 21:00 batch. The Music Sign re-check never joins a catch-up: after midnight that day can no longer be repaired, so a missed Music Sign evening is still a lost streak day.
 
 Still GPL-3.0, same as upstream; all changes in this fork are open under GPL-3.0 as well.
 
 ## Key Features
 
-- **Daily Check-in**: Completes both the web check-in and the YunBei (云贝) center check-in, and claims consecutive sign-in rewards once reached (3 / 7 / 28 days).
+- **Daily Check-in**: Completes both the web check-in and the YunBei (云贝) center check-in, and claims consecutive sign-in rewards once reached (3 / 7 / 28 days). Only two things count as "already signed today": a `code:200` from this run, or an explicit `sign:false` from YunBei (the documented "duplicate sign-in"). `-2` from `/api/point/dailyTask` is **no longer read as "already signed"** — that endpoint is undocumented in both reference protocol implementations, so it is treated as a rejection: no date gate, the server's `message` goes into the log verbatim, and the next trigger retries. A missing `sign` field means "no verdict this round", not "signed". And when `__csrf` cannot be read, **no write request is sent at all** — an answer to a token-less request was once read as "already signed", which gated the day and silently lost both check-ins.
 - **Vinyl Music Sign (黑胶乐签)**: Completes the daily Music Sign punch through the same encrypted weapi call; works without a VIP entitlement. Whether a day actually counted is judged by that day's `黑胶乐签每日打卡` (+3) entry in the growth-point ledger (`level/growth/details`) — the ladder prize line `黑胶乐签阶梯奖励 +30`, which the server writes in the same second, is deliberately not accepted as a punch. The `sign/info` record row comes from a slower pipeline that can stay missing indefinitely — verified on 10-09, where the ledger entry and the monthly counter both existed 41 hours before any row appeared — so it is no longer used as the verdict. The evening batch re-punches once only when today's ledger entry is still missing and coverage is proven, reports "cannot determine" when the ledger was never exhausted, and reports "this machine never took part in that day" for days before the extension was running; the following morning reports the final verdict for the day that just ended.
-- **YunBei Task Rewards**: Claims completed YunBei task rewards (e.g. Listen-to-Roaming) one by one between 21:00–23:59. Only finished tasks are claimed — the extension never performs the tasks themselves.
-- **VIP Growth Points**: Claims finished growth-task rewards once a day between 21:00–23:59 local time. Points never expire — a missed evening is picked up in the next window.
+- **YunBei Task Rewards**: Claims completed YunBei task rewards (e.g. Listen-to-Roaming) one by one between 21:00–23:59. Only finished tasks are claimed — the extension never performs the tasks themselves. A missed evening is picked up the next time the extension wakes.
+- **VIP Growth Points**: Claims finished growth-task rewards once a day between 21:00–23:59 local time. Points never expire — a missed evening is picked up the next time the extension wakes, not the next 21:00.
 - **Login Reminder**: If user has not logged in yet, will show a notification. Will switch to the opened webpage when user click it.
 - **Scheduled Execution**: If the browser is not open or in sleep mode, it will execute the next time it is opened; while a task inside the evening window still has no verdict, the alarm is re-armed every 20 minutes.
 - **Background Operation**: The check-in process is completed silently in the background, and will automatically close the page when it is finished.
@@ -143,7 +143,7 @@ Firefox users please open the link below to jump to the Firefox Add-ons Store, c
 
 1. **Login**: First, **log in** to your account on the [NetEase Cloud Music official website (music.163.com)](http://music.163.com/).
 2. **Auto Run**: The extension will automatically read your login status (Cookies) and perform the daily check-in task automatically in the background.
-3. **Evening Batch Window**: The Music Sign re-check/re-sign, YunBei task rewards and the growth claim all run between 21:00 and 23:59 (the YunBei sign and the first Music Sign punch still happen on the extension's first run of the day). Keep the browser open during that window. As long as any task in that batch still has no verdict, the extension re-arms the alarm every 20 minutes inside the window instead of waiting for tomorrow. Growth points and YunBei rewards missed one evening are picked up in the next window; a missed Music Sign evening cannot be recovered.
+3. **Evening Batch Window**: The Music Sign re-check/re-sign, YunBei task rewards and the growth claim all run between 21:00 and 23:59 (the YunBei sign and the first Music Sign punch still happen on the extension's first run of the day). Keep the browser open during that window. As long as any task in that batch still has no verdict, the extension re-arms the alarm every 20 minutes inside the window instead of waiting for tomorrow. If the whole window is missed, the growth claim and YunBei rewards are **picked up the next time the extension wakes up** — no need to wait for the next 21:00. The Music Sign re-check never runs outside the window, so a missed Music Sign evening cannot be recovered.
 4. **Status Toggle**: Click the logo to disable it when not needed, and the logo will automatically turn gray.
 
 ## Privacy Policy

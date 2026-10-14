@@ -314,20 +314,37 @@ function notLoggedIn(code, label) {
     return code === NOT_LOGGED_IN ? { done: false, needLogin: true, message: `${label}：未登录` } : null;
 }
 
-function rejected(code, label) {
-    return { done: false, message: `${label}：接口拒绝（本轮未落门，等下次触发重试）`, details: { code } };
+function rejected(code, label, envelope) {
+    return {
+        done: false,
+        message: `${label}：接口拒绝（本轮未落门，等下次触发重试）`,
+        details: { code, message: serverMessage(envelope) }
+    };
+}
+
+// 服务端的原话。/api/ 信封用 message，weapi 偶尔用 msg，两个都试一次。
+// 2026-10-15 那次「每日签到：今日已签」的 -2 就是因为原文没落盘，至今说不出它到底拒的是什么。
+function serverMessage(envelope) {
+    const text = envelope && (envelope.message ?? envelope.msg);
+    return typeof text === "string" && text ? text : null;
+}
+
+// 缺 csrf_token 时不得发出写请求：没有 token 的答复（-2 之类）不是「今天已签」的证据，
+// 而一旦按「已签」落当天日期门，这一天就再也不会重试 —— 签到类任务静默丢失就是这么来的。
+function requireCsrf(label, csrfToken) {
+    return csrfToken ? null : { done: false, message: `${label}：缺少 csrf_token，本轮不发写请求` };
 }
 
 async function signDailyTask() {
     const csrfToken = await getCookie("__csrf");
-    const params = new URLSearchParams({ type: "1" });
-    if (csrfToken) params.append("csrf_token", csrfToken);
+    const blocked = requireCsrf("每日签到", csrfToken);
+    if (blocked) return blocked;
 
     const response = await fetch(`https://${MUSIC_HOST}/api/point/dailyTask?type=1`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         credentials: "include",
-        body: params
+        body: new URLSearchParams({ type: "1", csrf_token: csrfToken })
     });
     const data = await response.json();
     // 与 weapiRequest 同一条例外：信封缺 code 时 `data.code === 200` 之类的哨兵会静默走空，
@@ -335,23 +352,43 @@ async function signDailyTask() {
     if (typeof data.code !== "number") throw new Error("响应缺少 code 字段 /api/point/dailyTask");
 
     if (data.code === 200) return { done: true, message: "每日签到成功", details: { point: data.point } };
-    if (data.code === -2) return { done: true, message: "每日签到：今日已签" };
-    return notLoggedIn(data.code, "每日签到") || rejected(data.code, "每日签到");
+    // -2 曾被直接当成「今日已签」并落门。这个映射没有任何来源：/api/point/dailyTask 在两个参考
+    // 协议仓库里零命中，而 2026-10-15 00:00:05 就是这句「今日已签」的当天，用户在客户端手动签到拿到了「签到成功」。
+    // 所以它按拒绝处理：不落门、把服务端原文带进日志，等下次触发或人工核对。
+    if (data.code === -2) return rejected(-2, "每日签到", data);
+    return notLoggedIn(data.code, "每日签到") || rejected(data.code, "每日签到", data);
 }
 
 async function signYunbei() {
-    const data = await weapiRequest(MUSIC_HOST, "/weapi/pointmall/user/sign", {}, await getCookie("__csrf"));
-    if (data.code !== 200) return notLoggedIn(data.code, "云贝签到") || rejected(data.code, "云贝签到");
+    const csrfToken = await getCookie("__csrf");
+    const blocked = requireCsrf("云贝签到", csrfToken);
+    if (blocked) return blocked;
 
-    return data.data && data.data.sign
-        ? { done: true, message: "云贝签到成功" }
-        : { done: true, message: "云贝签到：今日已签" };
+    const data = await weapiRequest(MUSIC_HOST, "/weapi/pointmall/user/sign", {}, csrfToken);
+    if (data.code !== 200) return notLoggedIn(data.code, "云贝签到") || rejected(data.code, "云贝签到", data);
+
+    // 「重复签到返回 false」是文档化语义（Go 参考 yunbei.go:292），但 `data` 缺失、字段形态不对
+    // 也会让 `data.data && data.data.sign` 变假 —— 那一次读不到结论，不是今天已签。
+    if (data.data && typeof data.data.sign === "boolean") {
+        return data.data.sign
+            ? { done: true, message: "云贝签到成功" }
+            : { done: true, message: "云贝签到：今日已签" };
+    }
+
+    return {
+        done: false,
+        message: "云贝签到：响应缺少 sign 字段（本轮未落门，等下次触发重试）",
+        details: { code: data.code, message: serverMessage(data) }
+    };
 }
 
 async function claimYunbeiStages() {
     const csrfToken = await getCookie("__csrf");
+    const blocked = requireCsrf("云贝连签奖励", csrfToken);
+    if (blocked) return blocked;
+
     const config = await weapiRequest(MUSIC_HOST, "/weapi/pointmall/user/sign/config", {}, csrfToken);
-    if (config.code !== 200) return notLoggedIn(config.code, "云贝连签奖励") || rejected(config.code, "云贝连签奖励");
+    if (config.code !== 200) return notLoggedIn(config.code, "云贝连签奖励") || rejected(config.code, "云贝连签奖励", config);
 
     const pending = ((config.data && config.data.lotteryConfig) || [])
         .filter((stage) => stage.baseLotteryId > 0 && stage.baseLotteryStatus === 0);
@@ -373,8 +410,11 @@ async function claimYunbeiStages() {
 
 async function claimYunbeiTasks() {
     const csrfToken = await getCookie("__csrf");
+    const blocked = requireCsrf("云贝任务", csrfToken);
+    if (blocked) return blocked;
+
     const todo = await weapiRequest(MUSIC_HOST, "/weapi/usertool/task/todo/query", {}, csrfToken);
-    if (todo.code !== 200) return notLoggedIn(todo.code, "云贝任务") || rejected(todo.code, "云贝任务");
+    if (todo.code !== 200) return notLoggedIn(todo.code, "云贝任务") || rejected(todo.code, "云贝任务", todo);
 
     const completed = (Array.isArray(todo.data) ? todo.data : [])
         .filter((task) => task && task.completed === true);
@@ -403,8 +443,8 @@ async function claimYunbeiTasks() {
 // 其中前三天账号只在客户端被动收签到结果、没有做过任何手动打卡。
 // 【服务端观察，非协议保证】上述对应关系只到 2026-10-08 的 4 条样本，取证表格见 PLAN-musicsign-verdict.md §1（只读探针原文）；
 // 它支撑「这个形式能打出请求」，不支撑「服务端永远按这个时刻写行」。
-async function requestVipSignPunch() {
-    return weapiRequest(VIP_CENTER_HOST, "/weapi/vip-center-bff/task/sign", {}, await getCookie("__csrf"));
+async function requestVipSignPunch(csrfToken) {
+    return weapiRequest(VIP_CENTER_HOST, "/weapi/vip-center-bff/task/sign", {}, csrfToken);
 }
 
 // "2026-10-09" → 本地日界 [当天 00:00:00.000, 次日 00:00:00.000)。
@@ -439,7 +479,7 @@ async function hasMusicSignLedgerEntry(day) {
         const reply = await weapiRequest(VIP_CENTER_HOST, "/weapi/vipnewcenter/app/level/growth/details",
             { limit: String(LEDGER_PAGE_SIZE), offset: String(page * LEDGER_PAGE_SIZE) }, csrfToken);
         pages++;
-        if (reply.code !== 200) return { code: reply.code };
+        if (reply.code !== 200) return { code: reply.code, message: serverMessage(reply) };
 
         const details = reply.data && Array.isArray(reply.data.details) ? reply.data.details : [];
         if (scanned.concat(details).some((item) => isMusicSignEntry(item, from, to))) {
@@ -466,9 +506,13 @@ async function hasMusicSignLedgerEntry(day) {
 let lastPunchAttemptAt = 0;
 
 async function signVipMusic() {
+    const csrfToken = await getCookie("__csrf");
+    const blocked = requireCsrf("乐签", csrfToken);
+    if (blocked) return blocked;
+
     lastPunchAttemptAt = Date.now();
-    const reply = await requestVipSignPunch();
-    if (reply.code !== 200) return notLoggedIn(reply.code, "乐签") || rejected(reply.code, "乐签");
+    const reply = await requestVipSignPunch(csrfToken);
+    if (reply.code !== 200) return notLoggedIn(reply.code, "乐签") || rejected(reply.code, "乐签", reply);
     // data===true 只代表请求被受理；是否计入要看成长值流水，终态由次日晨批核对。
     if (reply.data === true) return { done: true, message: "乐签：打卡请求已受理" };
 
@@ -490,7 +534,7 @@ async function finalizeVipSign() {
     prev.setDate(prev.getDate() - 1);
     const day = isoDate(prev);
     const ledger = await hasMusicSignLedgerEntry(day);
-    if ("code" in ledger) return notLoggedIn(ledger.code, "乐签终态") || rejected(ledger.code, "乐签终态");
+    if ("code" in ledger) return notLoggedIn(ledger.code, "乐签终态") || rejected(ledger.code, "乐签终态", ledger);
     // 措辞的强度跟着判据走：覆盖不到那天只能声明证据不足，不写"未计入"。
     if (ledger.counted === null) {
         return { done: false, message: `乐签 ${day} 无法判定：流水未覆盖当天`, details: { pages: ledger.pages } };
@@ -509,7 +553,7 @@ async function finalizeVipSign() {
 
 async function verifyVipSign() {
     const ledger = await hasMusicSignLedgerEntry(isoDate(new Date()));
-    if ("code" in ledger) return notLoggedIn(ledger.code, "乐签复核") || rejected(ledger.code, "乐签复核");
+    if ("code" in ledger) return notLoggedIn(ledger.code, "乐签复核") || rejected(ledger.code, "乐签复核", ledger);
     if (ledger.counted === true) return { done: true, message: "乐签复核：今日已计入", details: { pages: ledger.pages } };
     // 读不到流水就不动作：补打是写操作，不能建立在证据不足上。不落门 ⇒ 当晚窗口内的下一次触发再核一次。
     if (ledger.counted === null) {
@@ -524,9 +568,13 @@ async function verifyVipSign() {
 
     // 走到这里才是真缺口：晨批那次 data===true 的受理没换成计入。补打是当天唯一的修复机会，
     // 服务端按天去重（10-09 打两次只记一条），所以这次补打不会重复加分。
+    const csrfToken = await getCookie("__csrf");
+    const blocked = requireCsrf("乐签补打", csrfToken);
+    if (blocked) return blocked;
+
     lastPunchAttemptAt = Date.now();
-    const punch = await requestVipSignPunch();
-    if (punch.code !== 200) return notLoggedIn(punch.code, "乐签补打") || rejected(punch.code, "乐签补打");
+    const punch = await requestVipSignPunch(csrfToken);
+    if (punch.code !== 200) return notLoggedIn(punch.code, "乐签补打") || rejected(punch.code, "乐签补打", punch);
 
     return {
         done: true,
@@ -539,6 +587,9 @@ async function verifyVipSign() {
 
 async function claimVipGrowth() {
     const csrfToken = await getCookie("__csrf");
+    const blocked = requireCsrf("VIP 成长值", csrfToken);
+    if (blocked) return blocked;
+
     const reply = await weapiRequest(MUSIC_HOST, "/weapi/vipnewcenter/app/level/task/reward/getall", {}, csrfToken);
 
     if (reply.code === 200 && reply.data && reply.data.result === true) {
@@ -561,6 +612,7 @@ async function claimVipGrowth() {
         message: "VIP 成长值：本轮未领取（接口拒绝，等下次触发重试）",
         details: {
             code: reply.code,
+            message: serverMessage(reply),
             latestVipStatus: level ? level.latestVipStatus : null,
             maxLevel: level ? level.maxLevel : null
         }
@@ -603,10 +655,33 @@ const TASKS = [
     { key: "vipGrowth", batch: "night", run: claimVipGrowth }
 ];
 
-function shouldRunNight(now, doneOn) {
-    if (now.getHours() < VIP_CLAIM_HOUR) return false;
-    const today = localDate(now);
-    return TASKS.filter((item) => item.batch === "night").some((item) => doneOn[item.key] !== today);
+/**
+ * 晚批归属「哪一个晚上」，而不是墙钟当天：21:00 之前算刚过完的那个晚上。
+ * 它在午夜两侧是连续的（23:59 与次日 00:00 同属一个晚上），所以窗口内的落门与按当天归属逐字等价；
+ * 差别只在于错过 21:00–23:59 的领取批可以在次日凌晨补跑，而补跑写的门不会挤掉当晚的正常批。
+ */
+function eveningDate(now) {
+    const evening = new Date(now.getTime());
+    if (evening.getHours() < VIP_CLAIM_HOUR) evening.setDate(evening.getDate() - 1);
+    return evening;
+}
+
+// 领取类任务：奖励不过期，错过晚上只是晚领，不是丢掉。
+const NIGHT_CLAIM_KEYS = ["yunbeiTask", "vipGrowth"];
+
+/**
+ * 本轮该跑哪些晚批任务。
+ * 窗口内（21:00–23:59）：晚批三项按各自缺门，与旧行为等价。
+ * 窗口外：只为「刚过完、且本机那天确实打过卡的那个晚上」补跑两个领取任务。
+ *   - 复核/补打不进窗口外计划：过了午夜那天就补不了了，今天的由今天的晨批和今晚的窗口负责。
+ *   - 没有 vipSign 门 = 首装日或那天没运行，没有「上一个晚上」可补 ⇒ 窗口外零晚批请求。
+ */
+function nightPlan(now, doneOn) {
+    const evening = localDate(eveningDate(now));
+    const nightTasks = TASKS.filter((item) => item.batch === "night");
+    if (now.getHours() >= VIP_CLAIM_HOUR) return nightTasks.filter((item) => doneOn[item.key] !== evening);
+    if (doneOn.vipSign !== evening) return [];
+    return nightTasks.filter((item) => NIGHT_CLAIM_KEYS.includes(item.key) && doneOn[item.key] !== evening);
 }
 
 /**
@@ -663,14 +738,16 @@ function showLoginNotification() {
 /**
  * Main Orchestrator
  */
-async function runBatch(batch, doneOn) {
+async function runBatch(tasks, doneOn, eveningAttributed) {
     const settled = [];
     let loginRequired = false;
 
-    for (const task of TASKS.filter((item) => item.batch === batch)) {
-        // 日期归属按「写出结论的那一刻」现取：整批共用一个 today 时，23:59:5x 触发的那次会把晚批和门都记到前一日。
-        const today = localDate(new Date());
-        if (doneOn[task.key] === today) continue;
+    for (const task of tasks) {
+        // 归属日按「写出结论的那一刻」现取：整批共用一个值时，23:59:5x 触发的那次会把结论记到前一日。
+        // 晚批改按晚上归属（见 eveningDate），晨批仍按墙钟当天。
+        const now = new Date();
+        const day = localDate(eveningAttributed ? eveningDate(now) : now);
+        if (doneOn[task.key] === day) continue;
 
         let result;
         try {
@@ -689,7 +766,7 @@ async function runBatch(batch, doneOn) {
         }
 
         if (result.done) {
-            doneOn[task.key] = today;
+            doneOn[task.key] = day;
             if (await storageSet({ [TASK_STATE_KEY]: doneOn })) {
                 settled.push(task.key);
             } else {
@@ -725,6 +802,9 @@ async function runAllBatches() {
     const doneOn = { ...(stored[TASK_STATE_KEY] || {}) };
 
     if (!(await getCookie("MUSIC_U"))) {
+        // 只读接口在这个状态下同样回 301，所以没有「只跑只读、跳过写」的余地：整批一步不发。
+        // 这句必须写出来 —— 只看得到「Login page opened」的日志读不出「今天什么都没做」。
+        logWarn("未检测到登录 Cookie，本轮跳过全部任务");
         executeLoginTask();
         showLoginNotification();
         scheduleNextRun();
@@ -732,11 +812,14 @@ async function runAllBatches() {
         return;
     }
 
-    const morning = await runBatch("morning", doneOn);
+    // 晚批计划必须在晨批改内存门之前算：窗口外那条判据看的是「上一个晚上打没打过卡」，
+    // 而晨批正好会把 vipSign 门刷成新的一天，事后再算就永远补不上了。
+    const nightTasks = nightPlan(now, doneOn);
+    const morning = await runBatch(TASKS.filter((item) => item.batch === "morning"), doneOn, false);
     // 未登录时晚批只会同样被拒（还会把「未登录」再报一遍）⇒ 跳过；晚批日期门保持缺失，登录后下次触发补齐。
-    const night = morning.loginRequired || !shouldRunNight(now, doneOn)
+    const night = morning.loginRequired || nightTasks.length === 0
         ? { settled: [], loginRequired: false }
-        : await runBatch("night", doneOn);
+        : await runBatch(nightTasks, doneOn, true);
 
     if (morning.loginRequired || night.loginRequired) {
         executeLoginTask();
@@ -747,8 +830,9 @@ async function runAllBatches() {
     }
 
     // 晚批还有缺门的任务（瞬态失败或接口拒绝）⇒ 当晚窗口内再排一次；登录问题不重排，避免反复弹提醒。
+    // 计划要在整批跑完之后重算一次：用批前的旧缺门判断会把「刚补完」说成「还有缺门」，当晚白重排一次。
     scheduleNextRun();
-    scheduleVipClaim(shouldRunNight(new Date(), doneOn) && !morning.loginRequired && !night.loginRequired);
+    scheduleVipClaim(nightPlan(new Date(), doneOn).length > 0 && !morning.loginRequired && !night.loginRequired);
 }
 
 // onStartup、onInstalled 和一条迟到的 alarm 会在同一个 service worker 实例里并发触发，

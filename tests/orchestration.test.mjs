@@ -95,6 +95,7 @@ const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, LEDGER_COUNTED, OK_PUNCH, OK_TODO,
 
 const TODAY = "Mon Oct 05 2026";
 const YESTERDAY = "Sun Oct 04 2026";
+const TWO_DAYS_AGO = "Sat Oct 03 2026";
 // 只认这两个闹钟名，别的名字（历史残留）不得触发跑批。
 const ALARM_MORNING = "smartDailyNetEaseCheck";
 const ALARM_NIGHT = "netEaseVipGrowthClaim";
@@ -474,6 +475,54 @@ test("无 MUSIC_U 时零请求，只提醒登录，并且提醒确实落了门�
     assert.deepEqual(h.state.notifications, ["netease_login_needed"]);
     assert.equal(h.state.store.taskDoneOn, undefined, "未登录不得写任何日期门");
     assert.ok(h.messages().includes("登录提醒已发出"), "登录提醒的成败要写进日志，不能只在内存里假设成功");
+});
+
+// P0（2026-10-15 现场）：扩展当天报「每日签到：今日已签」「云贝签到：今日已签」，
+// 而用户在客户端手动签到拿到了「签到成功」——两个签到一个都没打成，还都落了门，整天不再重试。
+test("缺少 __csrf 时不发任何写请求，只允许只读的流水核对", async () => {
+    const h = await harness({ hour: 9, routes: ALL_OK, cookies: { MUSIC_U: MUSIC_U_VALUE } });
+    await h.run();
+    const writes = h.calls.filter((url) => !/app\/level\/growth\/details/.test(url));
+    assert.deepEqual(writes, [], `缺 token 还照发写请求：${JSON.stringify(writes)}`);
+    assert.deepEqual(h.state.store.taskDoneOn, { vipSignFinal: TODAY },
+        "只有只读核对那一条允许落门，签到/打卡/领奖都没有结论");
+    for (const label of ["每日签到", "云贝签到", "云贝连签奖励", "乐签"]) {
+        assert.ok(h.messages().includes(`${label}：缺少 csrf_token，本轮不发写请求`),
+            `实际：${JSON.stringify(h.messages())}`);
+    }
+});
+
+test("每日签到回 -2 时不落门，并把服务端原文带进日志", async () => {
+    const h = await harness({
+        hour: 9,
+        routes: ALL_OK.map((r) => (r === OK_SIGN
+            ? { re: OK_SIGN.re, body: { code: -2, message: "签到成功，每天只能签到一次" } } : r))
+    });
+    await h.run();
+    assert.ok(!("dailyTask" in h.state.store.taskDoneOn),
+        "-2 的语义没有任何来源（两个参考协议仓库里都没有这个端点），不得当成当天已签");
+    const entry = h.logs().find((e) => e.message === "每日签到：接口拒绝（本轮未落门，等下次触发重试）");
+    assert.ok(entry, `实际：${JSON.stringify(h.messages())}`);
+    assert.equal(entry.details.message, "签到成功，每天只能签到一次",
+        "服务端原话必须落盘，否则下一次还是在猜");
+});
+
+test("云贝签到读不到 sign 字段时不落门 —— 读不到不等于今日已签", async () => {
+    const h = await harness({
+        hour: 9,
+        routes: ALL_OK.map((r) => (r === OK_YUNBEI ? { re: OK_YUNBEI.re, body: { code: 200, message: "ok" } } : r))
+    });
+    await h.run();
+    assert.ok(!("yunbeiSign" in h.state.store.taskDoneOn), `实际：${JSON.stringify(h.messages())}`);
+    assert.ok(h.messages().includes("云贝签到：响应缺少 sign 字段（本轮未落门，等下次触发重试）"));
+
+    const duplicate = await harness({
+        hour: 9,
+        routes: ALL_OK.map((r) => (r === OK_YUNBEI ? { re: OK_YUNBEI.re, body: { code: 200, data: { sign: false } } } : r))
+    });
+    await duplicate.run();
+    assert.equal(duplicate.state.store.taskDoneOn.yunbeiSign, TODAY,
+        "明确 false 才是文档化的「重复签到」（Go 参考 yunbei.go:292），照常落门");
 });
 
 test("瞬态失败不写日期门，下次触发会重试且不弹登录提醒", async () => {
@@ -992,21 +1041,66 @@ test("测试夹具与源码不含真实形态的长数字标识", async () => {
     }
 });
 
-test("shouldRunNight 的边界：21:00 起、且晚批只要还有缺门就要跑", async () => {
+test("nightPlan 的边界：窗口内三项按缺门，窗口外只补前一晚的领取批", async () => {
     const h = await harness({ hour: 9, routes: [] });
-    const today = h.evaluate("new Date(2026, 9, 5).toDateString()");
+    const plan = (dateExpr, doneOnExpr) => h.evaluate(`nightPlan(${dateExpr}, ${doneOnExpr}).map((t) => t.key).join(",")`);
+    const ALL_NIGHT = "vipSignCheck,yunbeiTask,vipGrowth";
     const cases = [
-        ["20:59:59", "new Date(2026, 9, 5, 20, 59, 59)", "{}", false],
-        ["21:00:00", "new Date(2026, 9, 5, 21, 0, 0)", "{}", true],
-        ["23:59:59", "new Date(2026, 9, 5, 23, 59, 59)", "{}", true],
-        ["次日 00:00", "new Date(2026, 9, 6, 0, 0, 1)", "{}", false],
-        ["只领了成长值", "new Date(2026, 9, 5, 22, 0, 0)", `{ vipGrowth: ${JSON.stringify(today)} }`, true],
-        ["晚批三项全完成", "new Date(2026, 9, 5, 22, 0, 0)",
-            `{ vipSignCheck: ${JSON.stringify(today)}, yunbeiTask: ${JSON.stringify(today)}, vipGrowth: ${JSON.stringify(today)} }`, false],
+        ["20:59:59 窗口外、空门", "new Date(2026, 9, 5, 20, 59, 59)", "{}", ""],
+        ["21:00:00 窗口内、空门", "new Date(2026, 9, 5, 21, 0, 0)", "{}", ALL_NIGHT],
+        ["23:59:59 窗口内、空门", "new Date(2026, 9, 5, 23, 59, 59)", "{}", ALL_NIGHT],
+        ["窗口内三项全落门", "new Date(2026, 9, 5, 22, 0, 0)",
+            `{ vipSignCheck: ${JSON.stringify(TODAY)}, yunbeiTask: ${JSON.stringify(TODAY)}, vipGrowth: ${JSON.stringify(TODAY)} }`, ""],
+        // 次日 00:00：晚上归属仍是 10-05（=TODAY），所以只补两个领取任务，复核不进计划
+        ["次日 00:00、前一晚打过卡但没领取", "new Date(2026, 9, 6, 0, 0, 1)",
+            `{ vipSign: ${JSON.stringify(TODAY)}, yunbeiTask: ${JSON.stringify(YESTERDAY)}, vipGrowth: ${JSON.stringify(YESTERDAY)} }`,
+            "yunbeiTask,vipGrowth"],
+        ["次日 00:00、前一晚只缺云贝任务", "new Date(2026, 9, 6, 0, 0, 1)",
+            `{ vipSign: ${JSON.stringify(TODAY)}, vipGrowth: ${JSON.stringify(TODAY)}, yunbeiTask: ${JSON.stringify(YESTERDAY)} }`, "yunbeiTask"],
+        ["次日 00:00、前一晚三项已齐", "new Date(2026, 9, 6, 0, 0, 1)",
+            `{ vipSign: ${JSON.stringify(TODAY)}, vipSignCheck: ${JSON.stringify(TODAY)}, yunbeiTask: ${JSON.stringify(TODAY)}, vipGrowth: ${JSON.stringify(TODAY)} }`, ""],
+        ["次日 00:00、首装日没有 vipSign 门 ⇒ 无可补的晚上", "new Date(2026, 9, 6, 0, 0, 1)", "{}", ""],
+        ["次日 00:00、前一晚根本没运行（vipSign 是更早的）", "new Date(2026, 9, 6, 0, 0, 1)",
+            `{ vipSign: ${JSON.stringify(YESTERDAY)} }`, ""],
     ];
     for (const [label, dateExpr, doneOnExpr, expected] of cases) {
-        assert.equal(h.evaluate(`shouldRunNight(${dateExpr}, ${doneOnExpr})`), expected, `${label} 判定错误`);
+        assert.equal(plan(dateExpr, doneOnExpr), expected, `${label} 计划错误`);
     }
+    // 晚上归属在午夜两侧连续：21:00 之后算当天，之前算刚过完的那个晚上
+    assert.equal(h.evaluate("localDate(eveningDate(new Date(2026, 9, 5, 21, 0, 0)))"), TODAY);
+    assert.equal(h.evaluate("localDate(eveningDate(new Date(2026, 9, 5, 23, 59, 59)))"), TODAY);
+    assert.equal(h.evaluate("localDate(eveningDate(new Date(2026, 9, 6, 0, 0, 1)))"), TODAY);
+    assert.equal(h.evaluate("localDate(eveningDate(new Date(2026, 9, 5, 20, 59, 59)))"), YESTERDAY);
+});
+
+// SCH-H1 的后半段：错过 21:00–23:59 不等于这批作废。凌晨醒来只补领取类，
+// 且门必须落回「那个晚上」——落成新的一天会把当晚 21:00 的正常批挤掉。
+test("错过窗口：次日凌晨补跑领取批，门落回那个晚上，且不发乐签复核", async () => {
+    const h = await harness({
+        hour: 1,
+        routes: ALL_OK,
+        store: {
+            taskDoneOn: {
+                dailyTask: YESTERDAY, yunbeiSign: YESTERDAY, yunbeiStage: YESTERDAY,
+                vipSignFinal: YESTERDAY, vipSign: YESTERDAY,
+                vipSignCheck: TWO_DAYS_AGO, yunbeiTask: TWO_DAYS_AGO, vipGrowth: TWO_DAYS_AGO
+            }
+        }
+    });
+    await h.run();
+    const messages = h.messages();
+
+    assert.equal(h.calls.filter((url) => /reward\/getall/.test(url)).length, 1, "成长值必须补领");
+    assert.equal(h.calls.filter((url) => /usertool\/task\/todo\/query/.test(url)).length, 1, "云贝任务必须补领");
+    assert.equal(ledgerReads(h), 1, "只允许晨批核昨日那一次流水读，复核不进窗口外计划");
+    assert.equal(punched(h), 1, "只有晨批那一次打卡，不得有补打");
+    assert.ok(!messages.some((m) => m.startsWith("乐签复核")), `复核不得在窗口外运行：${JSON.stringify(messages)}`);
+
+    const gates = h.state.store.taskDoneOn;
+    assert.equal(gates.yunbeiTask, YESTERDAY, "补跑的门必须落回那个晚上，不能写成新的一天");
+    assert.equal(gates.vipGrowth, YESTERDAY, "同上");
+    assert.equal(gates.dailyTask, TODAY, "晨批仍按墙钟当天落门");
+    assert.equal(gates.vipSign, TODAY, "同上");
 });
 
 test("登录提醒点击：复用已开标签页并把失败说出来", async () => {
