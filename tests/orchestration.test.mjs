@@ -17,6 +17,9 @@ const OK_SIGN = { re: /api\/point\/dailyTask/, body: { code: 200, point: 2 } };
 const OK_YUNBEI = { re: /weapi\/pointmall\/user\/sign\?/, body: { code: 200, data: { sign: true } } };
 const NO_STAGE = { re: /weapi\/pointmall\/user\/sign\/config\?/, body: { code: 200, data: { lotteryConfig: [] } } };
 const OK_PUNCH = { re: /weapi\/vip-center-bff\/task\/sign/, body: { code: 200, data: true, message: "" } };
+// 桌面端乐签卡片：打卡后确认当天是否真的落签（sign && today）。
+const SIGNED_CARD = { re: /minidesk\/music\/sign\/pc/, body: { code: 200, data: { signInfoList: [{ dayText: "5日", sign: true, today: true, signTime: 0 }] } } };
+const UNSIGNED_CARD = { re: /minidesk\/music\/sign\/pc/, body: { code: 200, data: { signInfoList: [{ dayText: "5日", sign: false, today: true, signTime: 0 }] } } };
 const OK_CLAIM = { re: /task\/reward\/getall/, body: { code: 200, data: { result: true } } };
 const OK_TODO = {
     re: /usertool\/task\/todo\/query/,
@@ -91,7 +94,7 @@ function ledgerPages(bodies) {
     let n = 0;
     return { re: LEDGER_RE, body: () => bodies[Math.min(n++, bodies.length - 1)] };
 }
-const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, LEDGER_COUNTED, OK_PUNCH, OK_TODO, OK_RECEIVE, OK_CLAIM];
+const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, LEDGER_COUNTED, OK_PUNCH, SIGNED_CARD, OK_TODO, OK_RECEIVE, OK_CLAIM];
 
 const TODAY = "Mon Oct 05 2026";
 const YESTERDAY = "Sun Oct 04 2026";
@@ -358,6 +361,7 @@ test("并发触发（onStartup + onInstalled + 迟到的 alarm 同时到）每�
         "/weapi/pointmall/user/sign?": 1,
         "/weapi/pointmall/user/sign/config?": 1,
         "/weapi/vip-center-bff/task/sign": 1,
+        "/weapi/vipnewcenter/app/minidesk/music/sign/pc": 1,
         "/weapi/vipnewcenter/app/level/growth/details?": 2,
         "/weapi/usertool/task/todo/query": 1,
         "/weapi/usertool/task/point/receive": 1,
@@ -378,7 +382,7 @@ test("窗口外（09:30）只跑签到批，绝不触碰成长值接口", async 
     await h.run();
     const GROWTH_READ = (url) => /weapi\/vipnewcenter\/app\/level\/growth\/details/.test(url);
 
-    assert.equal(h.calls.length, 5, `期望 5 次请求，实际 ${h.calls.length}`);
+    assert.equal(h.calls.length, 6, `期望 6 次请求（含打卡后的卡片确认），实际 ${h.calls.length}`);
     assert.ok(h.calls.every((url) => !/reward\/getall/.test(url)), "窗口外不应调用 getall");
     assert.ok(h.calls.every((url) => !/usertool\//.test(url)), "窗口外不应触碰晚间批接口");
     assert.equal(punched(h), 1, "晨批照常打卡");
@@ -570,6 +574,35 @@ test("乐签打卡被拒不落门，当天下次触发还会再打", async () =>
     await h.run();
     assert.equal(punched(h), 2, "同一天两次尝试 = 拒绝后确实重试了");
     assert.ok(!("vipSign" in h.state.store.taskDoneOn), "一直失败就一直没有门");
+});
+
+// 2026-11-02 实测：打卡接口返回 data=true，但当天卡片仍显示未签、用户手机上还能手动打卡。
+// 受理不等于落签，必须用卡片确认；确认未签就立刻重试一次。
+test("打卡受理但卡片未签时当场重试，重试后已签就落门", async () => {
+    let reads = 0;
+    const h = await harness({
+        hour: 9,
+        routes: ALL_OK.map((r) => (r === SIGNED_CARD
+            ? { re: SIGNED_CARD.re, body: () => (reads++ === 0 ? UNSIGNED_CARD.body : SIGNED_CARD.body) }
+            : r))
+    });
+    await h.run();
+    assert.equal(punched(h), 2, "第一次受理后卡片未签，必须再打一次");
+    assert.ok(h.messages().some((m) => m === "乐签：打卡成功（重试后卡片确认）"),
+        `实际：${JSON.stringify(h.messages())}`);
+    assert.equal(h.state.store.taskDoneOn.vipSign, TODAY, "重试确认后才是当天的结论");
+});
+
+test("受理后两次卡片都未签：不落门，留给晚间复核补打", async () => {
+    const h = await harness({
+        hour: 9,
+        routes: ALL_OK.map((r) => (r === SIGNED_CARD ? UNSIGNED_CARD : r))
+    });
+    await h.run();
+    assert.equal(punched(h), 2, "卡片两次都说未签 ⇒ 服务端按天去重，重试一次是安全的");
+    assert.ok(h.messages().some((m) => m === "乐签：服务端受理但卡片仍未签，晚间复核将补打"),
+        `实际：${JSON.stringify(h.messages())}`);
+    assert.ok(!("vipSign" in h.state.store.taskDoneOn), "没签上不得落门");
 });
 
 // VER-M4：流水读取被拒时，复核既不能下结论，更不能把补打这个写操作发出去。
