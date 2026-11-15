@@ -340,23 +340,15 @@ async function signDailyTask() {
     const blocked = requireCsrf("每日签到", csrfToken);
     if (blocked) return blocked;
 
-    const response = await fetch(`https://${MUSIC_HOST}/api/point/dailyTask?type=1`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        credentials: "include",
-        body: new URLSearchParams({ type: "1", csrf_token: csrfToken })
-    });
-    const data = await response.json();
-    // 与 weapiRequest 同一条例外：信封缺 code 时 `data.code === 200` 之类的哨兵会静默走空，
-    // 「没读到结论」不能被写成结论。抛出去由 runBatch 按瞬态处理（不写门、下次重试）。
-    if (typeof data.code !== "number") throw new Error("响应缺少 code 字段 /api/point/dailyTask");
+    // 明文 /api/point/dailyTask 实测整天回 -2「重复签到」而客户端并未签到；两个 Go/Node 参考
+    // 实现的日常签到都走 weapi/eapi 加密通道（api/weapi/yunbei.go:37、module/daily_signin.js）。
+    // 改用 weapi 形态，type=1 对齐 PC/web 端。
+    const data = await weapiRequest(MUSIC_HOST, "/weapi/point/dailyTask", { type: "1" }, csrfToken);
+    if (typeof data.code !== "number") throw new Error("响应缺少 code 字段 /weapi/point/dailyTask");
 
+    // -2 在 weapi 形态下有明确语义「重复签到」（yunbei.go:23、daily_signin.js:3-8），是终态。
     if (data.code === 200) return { done: true, message: "每日签到成功", details: { point: data.point } };
-    // -2 在参考文档里的语义是「今日已签」（NeteaseMusic-API-main/module/daily_signin.js:3-8、
-    // netease-cloud-music-master/api/weapi/yunbei.go:16-27），但两次实测反例都出现在明文 /api 形态下：
-    // 2026-10-15 00:00:05 与 2026-11-02 00:00:05 都是 -2，用户随后在客户端手动签到仍拿到成功提示。
-    // 形态差异未查明前按拒绝处理：不落门、把服务端原文带进日志，等下次触发重试。
-    if (data.code === -2) return rejected(-2, "每日签到", data);
+    if (data.code === -2) return { done: true, message: "每日签到：今日已签" };
     return notLoggedIn(data.code, "每日签到") || rejected(data.code, "每日签到", data);
 }
 
@@ -368,18 +360,17 @@ async function signYunbei() {
     const data = await weapiRequest(MUSIC_HOST, "/weapi/pointmall/user/sign", {}, csrfToken);
     if (data.code !== 200) return notLoggedIn(data.code, "云贝签到") || rejected(data.code, "云贝签到", data);
 
-    // 「重复签到返回 false」是文档化语义（Go 参考 yunbei.go:292），但 `data` 缺失、字段形态不对
-    // 也会让 `data.data && data.data.sign` 变假 —— 那一次读不到结论，不是今天已签。
-    if (data.data && typeof data.data.sign === "boolean") {
-        return data.data.sign
-            ? { done: true, message: "云贝签到成功" }
-            : { done: true, message: "云贝签到：今日已签" };
+    // 不能把 sign=false 当「今日已签」：11-13/15/16 连续返回 false 并落门，用户手机端却仍是未签。
+    // 参考库虽有 sign=false=已签 的文档语义，但本项目 10-15 已在同形态上踩过假阳性；
+    // 只认 sign===true 为终态，false 留给当晚下一次触发重试（服务端按天去重，重试无副作用）。
+    if (data.data && data.data.sign === true) {
+        return { done: true, message: "云贝签到成功" };
     }
 
     return {
         done: false,
-        message: "云贝签到：响应缺少 sign 字段（本轮未落门，等下次触发重试）",
-        details: { code: data.code, message: serverMessage(data) }
+        message: "云贝签到：sign 不为 true（本轮未落门，等下次触发重试）",
+        details: { code: data.code, message: serverMessage(data), sign: data.data && data.data.sign }
     };
 }
 
@@ -506,25 +497,6 @@ async function hasMusicSignLedgerEntry(day) {
 // SW 被回收后这个记录就没了，那种情况下宁可多打一次（服务端按天去重），也不要漏掉真正的修复机会。
 let lastPunchAttemptAt = 0;
 
-// 桌面端乐签卡片：打卡后唯一能即时回答「今天到底签没签」的接口。
-// signInfoList 里 today=true 那条的 sign=true 才算当天已签（Go 参考 api/weapi/vip.go:1460-1519）。
-// 返回 { code } 表示接口拒绝；{ signed: null } 表示响应形态不认识 —— 两者都只是「读不到结论」，不得当成未签。
-async function fetchVipSignCard(csrfToken) {
-    const reply = await weapiRequest(
-        VIP_CENTER_HOST,
-        "/weapi/vipnewcenter/app/minidesk/music/sign/pc",
-        { type: "1" },
-        csrfToken
-    );
-    if (reply.code !== 200) return { code: reply.code, message: serverMessage(reply) };
-
-    const list = reply.data && reply.data.signInfoList;
-    if (!Array.isArray(list)) return { signed: null };
-    const today = list.find((item) => item && item.today === true);
-    if (!today || typeof today.sign !== "boolean") return { signed: null };
-    return { signed: today.sign };
-}
-
 async function signVipMusic() {
     const csrfToken = await getCookie("__csrf");
     const blocked = requireCsrf("乐签", csrfToken);
@@ -535,33 +507,11 @@ async function signVipMusic() {
     if (reply.code !== 200) return notLoggedIn(reply.code, "乐签") || rejected(reply.code, "乐签", reply);
     if (reply.data !== true) return { done: true, message: "乐签：本次未完成", details: { reason: reply.message || "" } };
 
-    // data===true 只代表请求被受理。2026-11-02 00:00:06 实测出现过「受理但当天没签上」，
-    // 用户在手机上仍能手动打卡，所以受理后必须用卡片确认，不能等到晚间复核。
-    const first = await fetchVipSignCard(csrfToken);
-    if ("code" in first) return notLoggedIn(first.code, "乐签卡片") || rejected(first.code, "乐签卡片", first);
-    if (first.signed === true) return { done: true, message: "乐签：打卡成功，卡片已确认" };
-    if (first.signed === null) return { done: true, message: "乐签：打卡请求已受理（卡片状态不可读，终态次日核对）" };
-
-    // 卡片明确说今天没签：服务端按天去重，立刻再打一次不会重复加分。
-    lastPunchAttemptAt = Date.now();
-    const retry = await requestVipSignPunch(csrfToken);
-    if (retry.code !== 200) return notLoggedIn(retry.code, "乐签重试") || rejected(retry.code, "乐签重试", retry);
-    if (retry.data !== true) {
-        return {
-            done: false,
-            message: "乐签：打卡受理后卡片仍显示未签，重试未完成，晚间复核补打",
-            details: { reason: retry.message || "" }
-        };
-    }
-
-    const second = await fetchVipSignCard(csrfToken);
-    if ("code" in second) return notLoggedIn(second.code, "乐签卡片") || rejected(second.code, "乐签卡片", second);
-    if (second.signed === true) return { done: true, message: "乐签：打卡成功（重试后卡片确认）" };
-    return {
-        done: false,
-        message: "乐签：服务端受理但卡片仍未签，晚间复核将补打",
-        details: { card: second.signed }
-    };
+    // data===true 代表打卡请求被受理。是否真正计入由成长流水的唯一判据在晚间复核确认（verifyVipSign）：
+    // 服务端写流水有几秒延迟，晨批立刻查也查不到；桌面卡片 11-15 更恒回 sign=false。
+    // 两者都会让当天落不了门、每次触发重打卡刷屏。故晨批受理即落门，判据完全交给晚间流水复核；
+    // 若当天真没计入，晚间复核会用流水发现缺口并补打（当天唯一修复机会）。
+    return { done: true, message: "乐签：打卡已受理，计入情况由晚间成长流水复核确认" };
 }
 
 // 本机有没有为那一天（或更晚的一天）参与过打卡。日期门里的 vipSign 值就是最后一次落该门那天的 localDate 形态；

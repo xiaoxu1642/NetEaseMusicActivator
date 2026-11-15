@@ -1,0 +1,35 @@
+{
+  "algorithm": "sha256-v1",
+  "dependency_lock_hashes": {},
+  "generated_by": "scripts/verify-baseline.sh compatible generator",
+  "git_head": "b798e4558aad1c357dedc15551d522637232a8a6",
+  "repo": "C:/KaiFa/NetEaseMusicActivator",
+  "repo_mode": "git",
+  "toolchain": {
+    "git": {
+      "version": "git version 2.56.0.windows.2",
+      "version_args": [
+        "--version"
+      ]
+    },
+    "node": {
+      "version": "v25.2.1",
+      "version_args": [
+        "--version"
+      ]
+    },
+    "python": {
+      "version": "Python 3.12.15",
+      "version_args": [
+        "--version"
+      ]
+    }
+  },
+  "verification": {
+    "command": "node --test tests/weapi.test.mjs tests/orchestration.test.mjs && node build.js",
+    "exit_code": 0,
+    "notes": "67/67 tests pass (incl. 2 mutation checks); build ok; baseline fingerprint excluded from fingerprint",
+    "result": "three sign-in verdict fixes (weapi dailyTask, yunbei sign=true only, vip ledger-based verdict)"
+  },
+  "worktree_fingerprint": "85ec15f631789861edb27e040cff8a6091cf60887987c84b35e1218c971f7c27"
+}
