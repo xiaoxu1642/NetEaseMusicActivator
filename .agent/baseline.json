@@ -28,8 +28,8 @@
   "verification": {
     "command": "node --test tests/weapi.test.mjs tests/orchestration.test.mjs && node build.js",
     "exit_code": 0,
-    "notes": "67/67 tests pass (incl. 2 mutation checks); build ok; baseline fingerprint excluded from fingerprint",
+    "notes": "67/67 tests pass; build ok; 2 mutation checks caught regressions; version bumped to 1.2.8",
     "result": "three sign-in verdict fixes (weapi dailyTask, yunbei sign=true only, vip ledger-based verdict)"
   },
-  "worktree_fingerprint": "85ec15f631789861edb27e040cff8a6091cf60887987c84b35e1218c971f7c27"
+  "worktree_fingerprint": "174a247f258af2f61b3177f6ae90cfb3402e93a6f6e43567c240c06a38a82c55"
 }
