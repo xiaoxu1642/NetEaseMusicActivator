@@ -1,0 +1,35 @@
+{
+  "algorithm": "sha256-v1",
+  "dependency_lock_hashes": {},
+  "generated_by": "scripts/verify-baseline.sh compatible generator",
+  "git_head": "b798e4558aad1c357dedc15551d522637232a8a6",
+  "repo": "C:/KaiFa/NetEaseMusicActivator",
+  "repo_mode": "git",
+  "toolchain": {
+    "git": {
+      "version": "git version 2.56.0.windows.2",
+      "version_args": [
+        "--version"
+      ]
+    },
+    "node": {
+      "version": "v25.2.1",
+      "version_args": [
+        "--version"
+      ]
+    },
+    "python": {
+      "version": "Python 3.12.15",
+      "version_args": [
+        "--version"
+      ]
+    }
+  },
+  "verification": {
+    "command": "node --test tests/weapi.test.mjs tests/orchestration.test.mjs && node build.js",
+    "exit_code": 0,
+    "notes": "67/67 tests pass; build ok; 2 mutation checks caught regressions; version bumped to 1.2.8",
+    "result": "three sign-in verdict fixes (weapi dailyTask, yunbei sign=true only, vip ledger-based verdict)"
+  },
+  "worktree_fingerprint": "174a247f258af2f61b3177f6ae90cfb3402e93a6f6e43567c240c06a38a82c55"
+}

@@ -13,13 +13,12 @@ import vm from "node:vm";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 
-const OK_SIGN = { re: /api\/point\/dailyTask/, body: { code: 200, point: 2 } };
+// 日常签到的 weapi 形态：v1.2.7 起 /api/point/dailyTask 明文恒回 -2（客户端未签），改用 weapi。
+const OK_SIGN = { re: /weapi\/point\/dailyTask/, body: { code: 200, point: 2 } };
+const DAILY_URL = "https://music.163.com/weapi/point/dailyTask?csrf_token=CSRF_PLACEHOLDER_DO_NOTLEAK";
 const OK_YUNBEI = { re: /weapi\/pointmall\/user\/sign\?/, body: { code: 200, data: { sign: true } } };
 const NO_STAGE = { re: /weapi\/pointmall\/user\/sign\/config\?/, body: { code: 200, data: { lotteryConfig: [] } } };
 const OK_PUNCH = { re: /weapi\/vip-center-bff\/task\/sign/, body: { code: 200, data: true, message: "" } };
-// 桌面端乐签卡片：打卡后确认当天是否真的落签（sign && today）。
-const SIGNED_CARD = { re: /minidesk\/music\/sign\/pc/, body: { code: 200, data: { signInfoList: [{ dayText: "5日", sign: true, today: true, signTime: 0 }] } } };
-const UNSIGNED_CARD = { re: /minidesk\/music\/sign\/pc/, body: { code: 200, data: { signInfoList: [{ dayText: "5日", sign: false, today: true, signTime: 0 }] } } };
 const OK_CLAIM = { re: /task\/reward\/getall/, body: { code: 200, data: { result: true } } };
 const OK_TODO = {
     re: /usertool\/task\/todo\/query/,
@@ -94,7 +93,7 @@ function ledgerPages(bodies) {
     let n = 0;
     return { re: LEDGER_RE, body: () => bodies[Math.min(n++, bodies.length - 1)] };
 }
-const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, LEDGER_COUNTED, OK_PUNCH, SIGNED_CARD, OK_TODO, OK_RECEIVE, OK_CLAIM];
+const ALL_OK = [OK_SIGN, OK_YUNBEI, NO_STAGE, LEDGER_COUNTED, OK_PUNCH, OK_TODO, OK_RECEIVE, OK_CLAIM];
 
 const TODAY = "Mon Oct 05 2026";
 const YESTERDAY = "Sun Oct 04 2026";
@@ -355,13 +354,13 @@ test("并发触发（onStartup + onInstalled + 迟到的 alarm 同时到）每�
     const h = await harness({ hour: 21, routes: ALL_OK });
     await h.runConcurrently(3);
 
-    // 成长值流水是只读核对，晨批核昨日 + 晚批核今日各读一次；其余（含打卡）全天各一次。
+    // 成长值流水是只读核对：晨批核昨日 + 晚批（21点窗口内）核今日各一次；其余（含打卡）全天各一次。
+    // v1.2.7 起乐签晨批不再读桌面卡片（恒回 false 导致刷屏），判据完全交给晚间流水复核。
     const expectedHits = {
-        "/api/point/dailyTask": 1,
+        "/weapi/point/dailyTask": 1,
         "/weapi/pointmall/user/sign?": 1,
         "/weapi/pointmall/user/sign/config?": 1,
         "/weapi/vip-center-bff/task/sign": 1,
-        "/weapi/vipnewcenter/app/minidesk/music/sign/pc": 1,
         "/weapi/vipnewcenter/app/level/growth/details?": 2,
         "/weapi/usertool/task/todo/query": 1,
         "/weapi/usertool/task/point/receive": 1,
@@ -371,6 +370,7 @@ test("并发触发（onStartup + onInstalled + 迟到的 alarm 同时到）每�
         const hits = h.calls.filter((url) => url.includes(endpoint));
         assert.equal(hits.length, times, `${endpoint} 被打了几次：${hits.length}，期望 ${times}`);
     }
+    assert.ok(!h.calls.some((url) => /minidesk\/music\/sign\/pc/.test(url)), "v1.2.7 起晨批不再读桌面卡片");
     assert.equal(h.state.store.vipGrowthLog.length, 1, "并发触发不得写出两条当日账目");
     assert.equal(h.state.store.taskDoneOn.vipSignCheck, TODAY);
     assert.equal(h.state.store.taskDoneOn.yunbeiTask, TODAY);
@@ -382,7 +382,7 @@ test("窗口外（09:30）只跑签到批，绝不触碰成长值接口", async 
     await h.run();
     const GROWTH_READ = (url) => /weapi\/vipnewcenter\/app\/level\/growth\/details/.test(url);
 
-    assert.equal(h.calls.length, 6, `期望 6 次请求（含打卡后的卡片确认），实际 ${h.calls.length}`);
+    assert.equal(h.calls.length, 5, `期望 5 次请求（晨批不再读卡片与今日流水），实际 ${h.calls.length}: ${JSON.stringify(h.calls)}`);
     assert.ok(h.calls.every((url) => !/reward\/getall/.test(url)), "窗口外不应调用 getall");
     assert.ok(h.calls.every((url) => !/usertool\//.test(url)), "窗口外不应触碰晚间批接口");
     assert.equal(punched(h), 1, "晨批照常打卡");
@@ -496,37 +496,39 @@ test("缺少 __csrf 时不发任何写请求，只允许只读的流水核对", 
     }
 });
 
-test("每日签到回 -2 时不落门，并把服务端原文带进日志", async () => {
+test("每日签到 weapi 形态回 -2 是明确的「重复签到」终态，照常落门", async () => {
     const h = await harness({
         hour: 9,
         routes: ALL_OK.map((r) => (r === OK_SIGN
-            ? { re: OK_SIGN.re, body: { code: -2, message: "签到成功，每天只能签到一次" } } : r))
+            ? { re: OK_SIGN.re, body: { code: -2, message: "重复签到" } } : r))
     });
     await h.run();
-    assert.ok(!("dailyTask" in h.state.store.taskDoneOn),
-        "-2 的语义没有任何来源（两个参考协议仓库里都没有这个端点），不得当成当天已签");
-    const entry = h.logs().find((e) => e.message === "每日签到：接口拒绝（本轮未落门，等下次触发重试）");
-    assert.ok(entry, `实际：${JSON.stringify(h.messages())}`);
-    assert.equal(entry.details.message, "签到成功，每天只能签到一次",
-        "服务端原话必须落盘，否则下一次还是在猜");
+    // weapi 形态下 -2 的语义有明确来源（yunbei.go:23、daily_signin.js:3-8）；明文 /api 形态的
+    // -2 才是假阳性根源（客户端未签却回 -2）。v1.2.7 改用 weapi 后，-2 恢复其文档语义。
+    assert.equal(h.state.store.taskDoneOn.dailyTask, TODAY, "weapi 的 -2 是重复签到，属于当天终态");
+    assert.ok(!h.messages().includes("每日签到：接口拒绝（本轮未落门，等下次触发重试）"));
 });
 
-test("云贝签到读不到 sign 字段时不落门 —— 读不到不等于今日已签", async () => {
+test("云贝签到读不到 sign 字段时不落门 —— 读不到不等于签到成功", async () => {
     const h = await harness({
         hour: 9,
         routes: ALL_OK.map((r) => (r === OK_YUNBEI ? { re: OK_YUNBEI.re, body: { code: 200, message: "ok" } } : r))
     });
     await h.run();
     assert.ok(!("yunbeiSign" in h.state.store.taskDoneOn), `实际：${JSON.stringify(h.messages())}`);
-    assert.ok(h.messages().includes("云贝签到：响应缺少 sign 字段（本轮未落门，等下次触发重试）"));
+    assert.ok(h.messages().includes("云贝签到：sign 不为 true（本轮未落门，等下次触发重试）"));
 
+    // v1.2.7：sign=false 不再当「今日已签」。11-13/15/16 连续返回 false 并落门，手机端却仍未签；
+    // 参考库的文档语义被本项目 10-15 的假阳性事故证伪，只认 sign===true，false 留待下次触发重试。
     const duplicate = await harness({
         hour: 9,
         routes: ALL_OK.map((r) => (r === OK_YUNBEI ? { re: OK_YUNBEI.re, body: { code: 200, data: { sign: false } } } : r))
     });
     await duplicate.run();
-    assert.equal(duplicate.state.store.taskDoneOn.yunbeiSign, TODAY,
-        "明确 false 才是文档化的「重复签到」（Go 参考 yunbei.go:292），照常落门");
+    assert.ok(!("yunbeiSign" in duplicate.state.store.taskDoneOn),
+        "sign=false 不得落门，等下次触发重试（服务端按天去重，重试无副作用）");
+    const entry = duplicate.logs().find((e) => e.message === "云贝签到：sign 不为 true（本轮未落门，等下次触发重试）");
+    assert.ok(entry && entry.details.sign === false, "false 原值要落日志，便于下一次定案");
 });
 
 test("瞬态失败不写日期门，下次触发会重试且不弹登录提醒", async () => {
@@ -576,33 +578,23 @@ test("乐签打卡被拒不落门，当天下次触发还会再打", async () =>
     assert.ok(!("vipSign" in h.state.store.taskDoneOn), "一直失败就一直没有门");
 });
 
-// 2026-11-02 实测：打卡接口返回 data=true，但当天卡片仍显示未签、用户手机上还能手动打卡。
-// 受理不等于落签，必须用卡片确认；确认未签就立刻重试一次。
-test("打卡受理但卡片未签时当场重试，重试后已签就落门", async () => {
-    let reads = 0;
-    const h = await harness({
-        hour: 9,
-        routes: ALL_OK.map((r) => (r === SIGNED_CARD
-            ? { re: SIGNED_CARD.re, body: () => (reads++ === 0 ? UNSIGNED_CARD.body : SIGNED_CARD.body) }
-            : r))
-    });
+// v1.2.7：桌面卡片恒回 false（11-15 全天样本），不再当落签判据。晨批打卡受理即落门，
+// 计入情况完全交给晚间成长流水复核；否则每次触发都因「卡片未签」重打卡刷屏。
+test("打卡受理即落门，不读卡片也不当场重试，计入交给晚间流水复核", async () => {
+    const h = await harness({ hour: 9, routes: ALL_OK });
     await h.run();
-    assert.equal(punched(h), 2, "第一次受理后卡片未签，必须再打一次");
-    assert.ok(h.messages().some((m) => m === "乐签：打卡成功（重试后卡片确认）"),
+    assert.equal(punched(h), 1, "受理即落门，不在晨批重复打卡");
+    assert.ok(!h.calls.some((url) => /minidesk\/music\/sign\/pc/.test(url)), "不再读桌面卡片");
+    assert.ok(h.messages().some((m) => m === "乐签：打卡已受理，计入情况由晚间成长流水复核确认"),
         `实际：${JSON.stringify(h.messages())}`);
-    assert.equal(h.state.store.taskDoneOn.vipSign, TODAY, "重试确认后才是当天的结论");
+    assert.equal(h.state.store.taskDoneOn.vipSign, TODAY, "受理即落当天门");
 });
 
-test("受理后两次卡片都未签：不落门，留给晚间复核补打", async () => {
-    const h = await harness({
-        hour: 9,
-        routes: ALL_OK.map((r) => (r === SIGNED_CARD ? UNSIGNED_CARD : r))
-    });
+test("乐签晨批只核昨日终态一次流水，不再为今日打卡多读", async () => {
+    const h = await harness({ hour: 9, routes: ALL_OK });
     await h.run();
-    assert.equal(punched(h), 2, "卡片两次都说未签 ⇒ 服务端按天去重，重试一次是安全的");
-    assert.ok(h.messages().some((m) => m === "乐签：服务端受理但卡片仍未签，晚间复核将补打"),
-        `实际：${JSON.stringify(h.messages())}`);
-    assert.ok(!("vipSign" in h.state.store.taskDoneOn), "没签上不得落门");
+    assert.equal(ledgerReads(h), 1, "晨批只读昨日终态那一次流水，今日计入留给晚批复核");
+    assert.ok(!h.messages().some((m) => m.includes("卡片仍未签")), "不应再出现卡片判据的措辞");
 });
 
 // VER-M4：流水读取被拒时，复核既不能下结论，更不能把补打这个写操作发出去。
@@ -634,9 +626,9 @@ test("VIP 成长值领取被拒不落门（当晚窗口内的重排才有意义�
 });
 
 test("301 未登录时中止整批并跳过晚批，只打一次请求", async () => {
-    const h = await harness({ hour: 21, routes: [{ re: /api\/point\/dailyTask/, body: { code: 301 } }, ...ALL_OK.slice(1)] });
+    const h = await harness({ hour: 21, routes: [{ re: /weapi\/point\/dailyTask/, body: { code: 301 } }, ...ALL_OK.slice(1)] });
     await h.run();
-    assert.deepEqual(h.calls, ["https://music.163.com/api/point/dailyTask?type=1"],
+    assert.deepEqual(h.calls, [DAILY_URL],
         `未登录后不该再打任何接口，实际：${JSON.stringify(h.calls)}`);
     assert.deepEqual(h.state.notifications, ["netease_login_needed"]);
     assert.equal(h.state.store.taskDoneOn, undefined);
@@ -899,7 +891,7 @@ test("云贝任务列表请求瞬态失败不写日期门，当晚下一次触�
 });
 
 test("接口返回 301 时中止整批，不再打下一个接口", async () => {
-    const h = await harness({ hour: 9, routes: [{ re: /api\/point\/dailyTask/, body: { code: 301 } }, ...ALL_OK.slice(1)] });
+    const h = await harness({ hour: 9, routes: [{ re: /weapi\/point\/dailyTask/, body: { code: 301 } }, ...ALL_OK.slice(1)] });
     await h.run();
     assert.equal(h.calls.length, 1, "301 之后应立刻中止，不再打下一个接口");
     assert.deepEqual(h.state.notifications, ["netease_login_needed"]);
@@ -988,7 +980,7 @@ test("日期门写不进盘就不算完成：内存门必须回滚", async () =>
     assert.ok(h.messages().some((m) => m.startsWith("storage.local.set 失败")));
 
     await h.run();
-    assert.equal(h.calls.filter((url) => /api\/point\/dailyTask/.test(url)).length, 2,
+    assert.equal(h.calls.filter((url) => /weapi\/point\/dailyTask/.test(url)).length, 2,
         "盘上没落成功就不能在内存里当已完成，否则同一天会把成功的接口重打一遍");
 });
 
