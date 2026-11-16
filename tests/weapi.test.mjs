@@ -121,8 +121,14 @@ test("2000 个随机 key 的 encSecKey 全为 256 hex 且与独立实现一致",
 // 拒绝采样（丢弃 >= 248）的唯一可观测后果：62 个字符频率相同。阈值写坏就前 8 个字符偏置。
 test("randomSecretKey 的 62 个字符频率均匀（拒绝采样在位）", () => {
     const counts = new Array(62).fill(0);
+    const base62 = weapi.BASE62;
+    // 62 桶下标查表：BASE62.indexOf(ch) 每查一个字符都要线性扫一遍 62 位，
+    // 换成 charCode → 桶号 的 O(1) 查表。样本量、桶口径、阈值都不变，守卫强度不动。
+    const bucketOf = new Uint8Array(128);
+    for (let i = 0; i < base62.length; i++) bucketOf[base62.charCodeAt(i)] = i;
     for (let i = 0; i < 20000; i++) {
-        for (const ch of weapi.randomSecretKey()) counts[weapi.BASE62.indexOf(ch)]++;
+        const key = weapi.randomSecretKey();
+        for (let j = 0; j < key.length; j++) counts[bucketOf[key.charCodeAt(j)]]++;
     }
     const spread = Math.max(...counts) - Math.min(...counts);
     assert.ok(spread <= 600, `62 桶极差 ${spread}，均匀性不成立（期望 < 600）`);

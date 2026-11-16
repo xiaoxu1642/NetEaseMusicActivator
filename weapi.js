@@ -17,14 +17,26 @@ function bytesToBase64(buffer) {
     return btoa(binary);
 }
 
-async function aesCbcEncryptToBase64(keyBytes, plaintext) {
-    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["encrypt"]);
+async function aesCbcEncryptWithKey(key, plaintext) {
     const cipher = await crypto.subtle.encrypt(
         { name: "AES-CBC", iv: WEAPI_IV },
         key,
         new TextEncoder().encode(plaintext)
     );
     return bytesToBase64(cipher);
+}
+
+async function aesCbcEncryptToBase64(keyBytes, plaintext) {
+    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-CBC" }, false, ["encrypt"]);
+    return aesCbcEncryptWithKey(key, plaintext);
+}
+
+let presetKeyPromise = null;
+function getPresetKey() {
+    if (!presetKeyPromise) {
+        presetKeyPromise = crypto.subtle.importKey("raw", WEAPI_PRESET_KEY, { name: "AES-CBC" }, false, ["encrypt"]);
+    }
+    return presetKeyPromise;
 }
 
 // 256 不整除 62（256 % 62 = 8），直接取模会让 BASE62 的前 8 个字符（a–h）各多一次命中机会，
@@ -62,7 +74,7 @@ function rsaNoPad(asciiText) {
 // fixedSecretKey 只给离线等价测试用，业务代码不要传第二个参数。
 async function weapiEncrypt(payload, fixedSecretKey) {
     const secretKey = fixedSecretKey || randomSecretKey();
-    const once = await aesCbcEncryptToBase64(WEAPI_PRESET_KEY, JSON.stringify(payload));
+    const once = await aesCbcEncryptWithKey(await getPresetKey(), JSON.stringify(payload));
     const params = await aesCbcEncryptToBase64(new TextEncoder().encode(secretKey), once);
     return { params, encSecKey: rsaNoPad([...secretKey].reverse().join("")) };
 }
@@ -75,11 +87,15 @@ async function weapiRequest(host, path, data, csrfToken) {
     // 副作用是它会被写进 HTTP 请求行；异常文本只带 path，凭据不会从错误消息里外流。
     url.searchParams.set("csrf_token", csrfToken || "");
 
+    const signal = typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(10000)
+        : undefined;
     const response = await fetch(url.toString(), {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         credentials: "include",
         body: new URLSearchParams({ params, encSecKey }),
+        signal,
     });
     if (!response.ok) throw new Error(`HTTP ${response.status} ${path}`);
 

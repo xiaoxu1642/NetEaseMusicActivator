@@ -21,9 +21,14 @@ const VIP_CENTER_HOST = "interface3.music.163.com";
 
 // 云贝任务奖励与成长值要等白天攒进度，乐签复核也要给服务端留出写流水的时间，所以这些动作固定在本地时间 21:00 之后。
 const VIP_CLAIM_HOUR = 21;
-// 晚批还有缺门的任务时，当晚每隔这么多分钟再排一次；越过 23:59 才顺延次日。
+// 晚批还有缺门的任务时，当晚按 20 → 40 → 80 分钟退避重排；越过 23:59 或达到上限才顺延次日。
 // 没有这条重排，21:30 那一次跑完后当晚剩余触发点为 0，一次网络抖动就等于断签一天。
+// 首次间隔固定 20 分钟（SCH-H1 钉死），后续翻倍给服务端留恢复时间；单晚最多 3 次重排，
+// 避免固定 20 分钟在失败夜里空转 9 轮。计数按晚上归属，跨晚自动重置；SW 回收会丢计数，多试无副作用。
 const NIGHT_RETRY_MINUTES = 20;
+const NIGHT_RETRY_MAX = 3;
+let nightRetryCount = 0;
+let nightRetryDate = "";
 const TASK_STATE_KEY = "taskDoneOn";
 const VIP_GROWTH_LOG_KEY = "vipGrowthLog";
 const VIP_GROWTH_LOG_MAX = 60;
@@ -41,7 +46,11 @@ const MUSIC_SIGN_GROWTH_POINT = 3;
 // 同一次跑批里晨批刚打完、晚批立刻复核时不能把「还没落地」读成缺口，给这么长的静置期。
 const PUNCH_SETTLE_MS = 10 * 60 * 1000;
 
-let logWriteQueue = Promise.resolve();
+// 日志写合并：同一轮微任务内的多条日志合并成一次 get+filter+set；微任务末 flush，harness 的 drain 之前必已完成。
+let pendingLogs = [];
+let logFlushScheduled = false;
+// 批内缓存的 __csrf：晨晚批多个任务原本各自 IPC 读一次。批处理结束清空，避免跨轮误用。
+let batchCsrfToken = null;
 
 function normalizeError(err) {
     if (!err) return "Unknown error";
@@ -84,40 +93,50 @@ function clampDetails(details) {
 }
 
 function enqueuePersistentLog(level, message, details) {
-    const entry = {
+    pendingLogs.push({
         ts: Date.now(),
         level,
         message,
         details: clampDetails(details)
+    });
+    if (logFlushScheduled) return;
+    logFlushScheduled = true;
+    queueMicrotask(flushPendingLogs);
+}
+
+// 一次 flush = 一次 get + 合并 pending + 过期过滤 + 一次 set。持有 logFlushScheduled 直到 set 完成，
+// 期间新到的日志留到下一次 flush，避免两次 get/set 交错把上一批覆盖掉。
+function flushPendingLogs() {
+    const batch = pendingLogs;
+    pendingLogs = [];
+    const done = () => {
+        logFlushScheduled = false;
+        if (pendingLogs.length > 0) {
+            logFlushScheduled = true;
+            queueMicrotask(flushPendingLogs);
+        }
     };
-
-    logWriteQueue = logWriteQueue
-        .then(() => new Promise((resolve) => {
-            // 日志通道自己不能递归调用 logWarn（那又要写日志），失败只走 console。
-            chrome.storage.local.get([LOG_STORAGE_KEY], (res) => {
-                if (chrome.runtime.lastError) {
-                    console.error("Persistent log read failed:", chrome.runtime.lastError.message);
-                    return resolve();
-                }
-                const rawLogs = Array.isArray(res[LOG_STORAGE_KEY]) ? res[LOG_STORAGE_KEY] : [];
-                const cutoff = Date.now() - LOG_RETENTION_MS;
-                const recentLogs = rawLogs.filter((item) => item && typeof item.ts === "number" && item.ts >= cutoff);
-                recentLogs.push(entry);
-                if (recentLogs.length > LOG_MAX_ENTRIES) {
-                    recentLogs.splice(0, recentLogs.length - LOG_MAX_ENTRIES);
-                }
-
-                chrome.storage.local.set({ [LOG_STORAGE_KEY]: recentLogs }, () => {
-                    if (chrome.runtime.lastError) {
-                        console.error("Persistent log write failed:", chrome.runtime.lastError.message);
-                    }
-                    resolve();
-                });
-            });
-        }))
-        .catch((err) => {
-            console.error("Persistent log write failed:", err);
+    // 日志通道自己不能递归调用 logWarn，失败只走 console。
+    chrome.storage.local.get([LOG_STORAGE_KEY], (res) => {
+        if (chrome.runtime.lastError) {
+            console.error("Persistent log read failed:", chrome.runtime.lastError.message);
+            done();
+            return;
+        }
+        const rawLogs = Array.isArray(res[LOG_STORAGE_KEY]) ? res[LOG_STORAGE_KEY] : [];
+        const cutoff = Date.now() - LOG_RETENTION_MS;
+        const recentLogs = rawLogs.filter((item) => item && typeof item.ts === "number" && item.ts >= cutoff);
+        recentLogs.push(...batch);
+        if (recentLogs.length > LOG_MAX_ENTRIES) {
+            recentLogs.splice(0, recentLogs.length - LOG_MAX_ENTRIES);
+        }
+        chrome.storage.local.set({ [LOG_STORAGE_KEY]: recentLogs }, () => {
+            if (chrome.runtime.lastError) {
+                console.error("Persistent log write failed:", chrome.runtime.lastError.message);
+            }
+            done();
         });
+    });
 }
 
 function logInfo(message, details) {
@@ -157,12 +176,8 @@ function pruneLogs(callback) {
         const rawLogs = Array.isArray(res[LOG_STORAGE_KEY]) ? res[LOG_STORAGE_KEY] : [];
         const cutoff = Date.now() - LOG_RETENTION_MS;
         const recentLogs = rawLogs.filter((item) => item && typeof item.ts === "number" && item.ts >= cutoff);
-        chrome.storage.local.set({ [LOG_STORAGE_KEY]: recentLogs }, () => {
-            if (chrome.runtime.lastError) {
-                console.error("Log prune write failed:", chrome.runtime.lastError.message);
-            }
-            if (typeof callback === "function") callback(recentLogs);
-        });
+        // enqueue 路径已做同样的过期过滤，这里只读不写（prune 写回是每次 SW 唤醒的一次全量 IO）。
+        if (typeof callback === "function") callback(recentLogs);
     });
 }
 
@@ -217,6 +232,11 @@ function getCookie(name) {
     });
 }
 
+// 批内复用 __csrf：runAllBatches 开头读一次，8 个任务共享；未开批时回退到逐个读取。
+function getCsrfToken() {
+    return batchCsrfToken !== null ? Promise.resolve(batchCsrfToken) : getCookie("__csrf");
+}
+
 function localDate(date) {
     return date.toDateString();
 }
@@ -254,7 +274,8 @@ function updateUI(isEnabled) {
 function createAlarm(name, when, label) {
     chrome.alarms.create(name, { when }, () => {
         if (chromeFailed("alarms.create", { name })) return;
-        logInfo(label, new Date(when).toLocaleString());
+        // 排程日志只在 console：每次 SW 唤醒的排程都落盘纯属写放大，排障看 console 足够。
+        console.log(label, new Date(when).toLocaleString());
     });
 }
 
@@ -275,12 +296,25 @@ function scheduleVipClaim(retryWithinWindow) {
     const now = new Date();
     const nextRun = new Date(now.getTime());
     if (retryWithinWindow) {
-        nextRun.setMinutes(now.getMinutes() + NIGHT_RETRY_MINUTES, 0, 0);
-        if (nextRun.getDate() === now.getDate() && nextRun.getHours() >= VIP_CLAIM_HOUR) {
-            createAlarm(ALARM_VIP_CLAIM, nextRun.getTime(), "Evening batch retry scheduled at");
-            return;
+        const evening = localDate(eveningDate(now));
+        if (nightRetryDate !== evening) {
+            nightRetryDate = evening;
+            nightRetryCount = 0;
+        }
+        // 首次 20 分钟不变（SCH-H1），之后 40 / 80 分钟退避；达到上限则不再排当晚重排。
+        if (nightRetryCount < NIGHT_RETRY_MAX) {
+            const delay = NIGHT_RETRY_MINUTES * (2 ** nightRetryCount);
+            nightRetryCount++;
+            nextRun.setMinutes(now.getMinutes() + delay, 0, 0);
+            if (nextRun.getDate() === now.getDate() && nextRun.getHours() >= VIP_CLAIM_HOUR) {
+                createAlarm(ALARM_VIP_CLAIM, nextRun.getTime(), "Evening batch retry scheduled at");
+                return;
+            }
         }
         nextRun.setTime(now.getTime());
+    } else {
+        // 本轮无缺门（或登录问题）：清掉当晚计数，别让下一晚的首次重排从上次的中途间隔开始。
+        nightRetryCount = 0;
     }
     nextRun.setHours(nextRun.getHours() >= VIP_CLAIM_HOUR ? 24 + VIP_CLAIM_HOUR : VIP_CLAIM_HOUR, 0, 0, 0);
     createAlarm(ALARM_VIP_CLAIM, nextRun.getTime(), "Next evening batch scheduled at");
@@ -336,7 +370,7 @@ function requireCsrf(label, csrfToken) {
 }
 
 async function signDailyTask() {
-    const csrfToken = await getCookie("__csrf");
+    const csrfToken = await getCsrfToken();
     const blocked = requireCsrf("每日签到", csrfToken);
     if (blocked) return blocked;
 
@@ -353,7 +387,7 @@ async function signDailyTask() {
 }
 
 async function signYunbei() {
-    const csrfToken = await getCookie("__csrf");
+    const csrfToken = await getCsrfToken();
     const blocked = requireCsrf("云贝签到", csrfToken);
     if (blocked) return blocked;
 
@@ -375,7 +409,7 @@ async function signYunbei() {
 }
 
 async function claimYunbeiStages() {
-    const csrfToken = await getCookie("__csrf");
+    const csrfToken = await getCsrfToken();
     const blocked = requireCsrf("云贝连签奖励", csrfToken);
     if (blocked) return blocked;
 
@@ -401,7 +435,7 @@ async function claimYunbeiStages() {
 }
 
 async function claimYunbeiTasks() {
-    const csrfToken = await getCookie("__csrf");
+    const csrfToken = await getCsrfToken();
     const blocked = requireCsrf("云贝任务", csrfToken);
     if (blocked) return blocked;
 
@@ -461,7 +495,7 @@ function isMusicSignEntry(item, from, to) {
 // 返回 { code } 表示非 200，由调用方分「未登录 / 拒绝重试」。
 async function hasMusicSignLedgerEntry(day) {
     const [from, to] = dayBounds(day);
-    const csrfToken = await getCookie("__csrf");
+    const csrfToken = await getCsrfToken();
     const scanned = [];
     let pages = 0;
     let reachedEnd = false;
@@ -498,7 +532,7 @@ async function hasMusicSignLedgerEntry(day) {
 let lastPunchAttemptAt = 0;
 
 async function signVipMusic() {
-    const csrfToken = await getCookie("__csrf");
+    const csrfToken = await getCsrfToken();
     const blocked = requireCsrf("乐签", csrfToken);
     if (blocked) return blocked;
 
@@ -563,7 +597,7 @@ async function verifyVipSign() {
 
     // 走到这里才是真缺口：晨批那次 data===true 的受理没换成计入。补打是当天唯一的修复机会，
     // 服务端按天去重（10-09 打两次只记一条），所以这次补打不会重复加分。
-    const csrfToken = await getCookie("__csrf");
+    const csrfToken = await getCsrfToken();
     const blocked = requireCsrf("乐签补打", csrfToken);
     if (blocked) return blocked;
 
@@ -581,7 +615,7 @@ async function verifyVipSign() {
 }
 
 async function claimVipGrowth() {
-    const csrfToken = await getCookie("__csrf");
+    const csrfToken = await getCsrfToken();
     const blocked = requireCsrf("VIP 成长值", csrfToken);
     if (blocked) return blocked;
 
@@ -777,6 +811,15 @@ async function runBatch(tasks, doneOn, eveningAttributed) {
 }
 
 async function runAllBatches() {
+    // 批内 csrf 只在真正跑批时读取，finally 保证任何返回路径都不把 token 泄漏到下一轮/SW 生命周期。
+    try {
+        await runAllBatchesInner();
+    } finally {
+        batchCsrfToken = null;
+    }
+}
+
+async function runAllBatchesInner() {
     const stored = await storageGet(["isEnabled", TASK_STATE_KEY]);
     if (!stored) {
         // 读不到状态就无从判断哪些任务当天已经完成过，这时跑批等于把全部接口重打一遍 ⇒ 本轮直接放弃。
@@ -806,6 +849,9 @@ async function runAllBatches() {
         scheduleVipClaim(false);
         return;
     }
+
+    // 批内只读一次 __csrf，8 个任务与流水核对共用；缺 token 时缓存空串，写请求仍被 requireCsrf 挡住。
+    batchCsrfToken = await getCookie("__csrf");
 
     // 晚批计划必须在晨批改内存门之前算：窗口外那条判据看的是「上一个晚上打没打过卡」，
     // 而晨批正好会把 vipSign 门刷成新的一天，事后再算就永远补不上了。

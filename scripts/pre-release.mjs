@@ -40,8 +40,9 @@ for (const file of packageFiles) {
         check(`包内含 ${file}`, false, "文件不存在");
         continue;
     }
-    check(`${file} 产物 == 源码`, blobHash(src) === blobHash(built),
-        `${blobHash(built)} vs ${blobHash(src)}`);
+    const srcHash = blobHash(src);
+    const builtHash = blobHash(built);
+    check(`${file} 产物 == 源码`, srcHash === builtHash, `${builtHash} vs ${srcHash}`);
 }
 
 // LICENSE 被 git 跟踪 && 在包里 —— 六个已发布 zip 缺它的那条 T 级就在这里现形。
@@ -54,13 +55,13 @@ try {
 check("LICENSE 被仓库跟踪", trackedLicense === "LICENSE");
 
 const version = distManifest.version;
+// 只查一次：两个分支都要用 HEAD 上的 tag 列表。
+const headTags = git("tag", "--points-at", "HEAD").split(/\r?\n/).filter(Boolean);
 if (expectedTag) {
     check("tag 名与 manifest 版本一致", expectedTag === `v${version}`, `${expectedTag} vs v${version}`);
-    const pointsAt = git("tag", "--points-at", "HEAD").split(/\r?\n/).filter(Boolean);
-    if (pointsAt.includes(expectedTag)) check("tag 已指向 HEAD", true, expectedTag);
-    else check("tag 已指向 HEAD", false, `HEAD 上的 tag: ${pointsAt.join(", ") || "无"}（还没打？）`);
+    if (headTags.includes(expectedTag)) check("tag 已指向 HEAD", true, expectedTag);
+    else check("tag 已指向 HEAD", false, `HEAD 上的 tag: ${headTags.join(", ") || "无"}（还没打？）`);
 } else {
-    const headTags = git("tag", "--points-at", "HEAD").split(/\r?\n/).filter(Boolean);
     check("HEAD 上的 tag 版本 == manifest 版本",
         headTags.length === 0 || headTags.every((t) => t === `v${version}`),
         `${headTags.join(", ") || "尚未打 tag"} vs v${version}`);

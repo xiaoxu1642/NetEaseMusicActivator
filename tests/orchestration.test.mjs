@@ -924,6 +924,24 @@ test("瞬态失败留下的缺门，当晚窗口内必须还有触发机会", as
     assert.equal(new Date(lastAlarm(h, ALARM_NIGHT).info.when).getDate(), 6, "全部门落齐后顺延次日");
 });
 
+test("晚间重排退避：首次 20 分钟，之后 40/80 分钟，第四次达上限顺延次日", async () => {
+    const h = await harness({ hour: 21, routes: ALL_OK });
+    const base = new Date(2026, 9, 5, 21, 30, 0).getTime();
+    const expectedMinutes = [20, 40, 80];
+    for (let i = 0; i < expectedMinutes.length; i++) {
+        h.evaluate("scheduleVipClaim(true)");
+        const alarm = lastAlarm(h, ALARM_NIGHT);
+        assert.equal(alarm.info.when - base, expectedMinutes[i] * 60 * 1000,
+            `第 ${i + 1} 次重排间隔应为 ${expectedMinutes[i]} 分钟`);
+        assert.equal(new Date(alarm.info.when).getDate(), 5, "前三次重排仍在同一晚窗口内");
+    }
+    // 单晚上限 3 次：第四次不再排当晚重排，改为顺延次日 21:00。
+    h.evaluate("scheduleVipClaim(true)");
+    const fourth = new Date(lastAlarm(h, ALARM_NIGHT).info.when);
+    assert.equal(fourth.getDate(), 6, "第四次应顺延次日");
+    assert.equal(fourth.getHours(), 21);
+});
+
 test("只有这两个 alarm 名会触发跑批", async () => {
     const h = await harness({ hour: 21, routes: ALL_OK });
     await h.fireAlarm("someLegacyAlarm");
